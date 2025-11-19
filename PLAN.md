@@ -79,3 +79,78 @@ We will construct a "Fail Fast" feedback loop:
 
 ### Success Criteria
 If `EXPLAIN` consistently returns specific error messages for hallucinated columns without executing the query, the thesis hypothesis is validated, and we proceed to building the constrained beam search decoder (Milestone 2).
+
+---
+
+## 6. Milestone 2: Iterative EXPLAIN-Guided Refinement
+
+**Status:** Milestone 1 ✓ Complete (88% detection, 0.2ms latency, 100% specificity)
+
+### Goal
+Integrate EXPLAIN verification into a feedback loop that iteratively refines generated SQL queries.
+
+### Approach: Error-Driven Refinement
+Instead of one-shot generation, we implement a closed-loop system:
+1. Generate initial SQL query from natural language
+2. Verify with EXPLAIN - if valid, return
+3. If error: extract specific error message
+4. Provide error feedback to model: "This query failed with: {error}. Fix it."
+5. Repeat until valid (max 3 iterations)
+
+### Implementation Plan
+1. **ExplainGuidedGenerator Class:**
+   - `generate()` - Initial SQL generation
+   - `refine()` - Error-driven refinement step
+   - `generate_with_feedback()` - Full iterative loop
+
+2. **Error Feedback Prompting:**
+   - Template: "The query `{sql}` failed with error: `{error_msg}`. Generate a corrected query."
+   - Provide schema context in each iteration
+   - Track iteration history to prevent loops
+
+3. **Evaluation on Spider:**
+   - Test on 100 dev examples
+   - Compare: baseline (no feedback) vs iterative (with feedback)
+   - Track: success rate by iteration, total latency, error types
+
+### Expected Deliverables
+1. `src/egtts/guided.py` - ExplainGuidedGenerator implementation
+2. `scripts/milestone2_evaluation.py` - Evaluation script
+3. Results analysis:
+   - Initial accuracy (iteration 0)
+   - Post-refinement accuracy (after max 3 iterations)
+   - Average iterations needed for success
+   - Latency breakdown (generation vs verification)
+
+### Success Criteria
+- **≥90% of initially invalid queries fixed** within 3 iterations
+- **Each iteration takes <5 seconds** (generation + EXPLAIN)
+- **Net improvement ≥20%** over baseline accuracy
+- **Error recovery analysis:** Which error types are fixable vs persistent?
+
+### Metrics to Track
+```python
+{
+  "baseline_accuracy": float,        # % valid on first try
+  "final_accuracy": float,            # % valid after refinement
+  "avg_iterations": float,            # Mean iterations to success
+  "iteration_breakdown": {            # Success rate by iteration
+    "iter_0": float,
+    "iter_1": float,
+    "iter_2": float,
+    "iter_3": float
+  },
+  "latency": {
+    "avg_generation_ms": float,
+    "avg_explain_ms": float,
+    "avg_total_ms": float
+  },
+  "error_recovery": {
+    "schema_errors_fixed": int,       # "no such column" fixed
+    "syntax_errors_fixed": int,       # Syntax errors fixed
+    "persistent_errors": int          # Failed after 3 iterations
+  }
+}
+```
+
+If this iterative approach successfully improves accuracy, Milestone 3 will implement **token-level guidance** with constrained decoding.

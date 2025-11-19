@@ -2,6 +2,7 @@
 
 from .data import get_database_path, load_spider
 from .database import ExplainError, ExplainSuccess, explain_query
+from .guided import ExplainGuidedGenerator, GenerationResult
 from .model import create_sql_prompt, generate_sql, load_model
 
 __all__ = [
@@ -13,4 +14,6 @@ __all__ = [
     "load_model",
     "create_sql_prompt",
     "generate_sql",
+    "ExplainGuidedGenerator",
+    "GenerationResult",
 ]
