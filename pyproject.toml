@@ -1,0 +1,36 @@
+[project]
+name = "egtts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.11.0",
+    "datasets>=4.4.1",
+    "gdown>=5.2.0",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.5",
+    "ty>=0.0.1a27",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["egtts*"]
+
+[tool.ruff]
+exclude = ["data", "results", ".venv"]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]  # pycodestyle errors, pyflakes, isort
