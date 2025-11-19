@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=1.11.0",
     "datasets>=4.4.1",
     "gdown>=5.2.0",
+    "outlines>=1.2.8",
     "torch>=2.9.1",
     "torchvision>=0.24.1",
     "tqdm>=4.67.1",

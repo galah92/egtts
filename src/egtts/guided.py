@@ -1,10 +1,12 @@
 """EXPLAIN-guided SQL generation with iterative refinement."""
 
+import re
 import time
 from dataclasses import dataclass
 
 from .database import ExplainSuccess, explain_query
 from .model import create_sql_prompt, generate_sql
+from .schema import SchemaIndex, build_schema_index
 
 
 @dataclass
@@ -284,5 +286,171 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
             error_history=error_history,
             latency_ms=total_time,
             generation_times_ms=[gen_time],
+            explain_times_ms=explain_times,
+        )
+
+    def _validate_schema_references(self, sql: str, schema_index: SchemaIndex) -> tuple[bool, str]:
+        """
+        Validate that all table and column references in SQL exist in schema.
+
+        Args:
+            sql: SQL query to validate
+            schema_index: Schema index for validation
+
+        Returns:
+            Tuple of (valid, error_message)
+        """
+        sql_upper = sql.upper()
+
+        # Extract table references (after FROM and JOIN)
+        table_pattern = r"\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+        tables = re.findall(table_pattern, sql, re.IGNORECASE)
+
+        for table in tables:
+            if not schema_index.has_table(table):
+                return False, f"Table '{table}' not found in schema"
+
+        # Extract column references (simplified - would need full SQL parser for accuracy)
+        # Look for SELECT columns, WHERE/ON conditions, GROUP BY, ORDER BY
+        select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
+        if select_match:
+            select_clause = select_match.group(1)
+            # Extract column names (simplified - handles basic cases)
+            column_pattern = r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b"
+            potential_columns = re.findall(column_pattern, select_clause)
+
+            # Filter out SQL keywords and functions
+            sql_keywords = {"COUNT", "SUM", "AVG", "MIN", "MAX", "AS", "DISTINCT", "ALL"}
+            for col in potential_columns:
+                if col.upper() not in sql_keywords and not col.startswith("'"):
+                    if not schema_index.has_column(col):
+                        return False, f"Column '{col}' not found in schema"
+
+        return True, ""
+
+    def generate_with_schema_guidance(
+        self, question: str, schema: str, db_path: str, num_beams: int = 5
+    ) -> GenerationResult:
+        """
+        Generate SQL with post-generation schema validation (Strategy A).
+
+        This implements the "Schema Lookup" approach from the guidance:
+        - Generate multiple beam candidates normally (fast)
+        - Validate each candidate against schema index (very fast <1ms)
+        - Filter candidates with invalid schema references
+        - From remaining candidates, pick first EXPLAIN-valid one
+
+        This is simpler and faster than token-level validation, while still
+        preventing schema hallucinations from being selected.
+
+        Args:
+            question: Natural language question
+            schema: Database schema
+            db_path: Path to SQLite database
+            num_beams: Number of beams to generate (default: 5)
+
+        Returns:
+            GenerationResult with selected SQL and metadata
+        """
+        import torch
+
+        start_time = time.perf_counter()
+
+        # Build schema index
+        index_start = time.perf_counter()
+        schema_index = build_schema_index(db_path)
+        index_time = (time.perf_counter() - index_start) * 1000
+
+        # Create prompt
+        prompt = create_sql_prompt(question, schema, self.tokenizer)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate beams normally (no logits processor - fast and correct)
+        gen_start = time.perf_counter()
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=256,
+                num_beams=num_beams,
+                num_return_sequences=num_beams,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Decode all candidates
+        candidates = []
+        for output in outputs:
+            generated_ids = output[input_length:]
+            sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+            # Clean up SQL
+            if "```sql" in sql.lower():
+                sql = sql.split("```sql", 1)[1].split("```")[0].strip()
+            elif "```" in sql:
+                parts = sql.split("```")
+                if len(parts) >= 2:
+                    sql = parts[1].strip()
+
+            lines = sql.split("\n")
+            sql_lines = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("--") and not line.lower().startswith(
+                    ("this query", "the query", "note:")
+                ):
+                    sql_lines.append(line)
+                elif sql_lines:
+                    break
+
+            sql = " ".join(sql_lines).strip()
+            candidates.append(sql)
+
+        # Validate and test each candidate
+        explain_times = []
+        error_history = []
+        schema_validation_count = 0
+
+        for idx, sql in enumerate(candidates):
+            # First check schema (very fast)
+            schema_valid, schema_error = self._validate_schema_references(sql, schema_index)
+
+            if not schema_valid:
+                error_history.append(f"Beam {idx}: Schema validation failed: {schema_error}")
+                schema_validation_count += 1
+                continue  # Skip EXPLAIN if schema is invalid
+
+            # Then check with EXPLAIN
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                # Found valid candidate
+                total_time = (time.perf_counter() - start_time) * 1000
+                return GenerationResult(
+                    sql=sql,
+                    valid=True,
+                    iterations=idx,  # Use beam index as "iteration"
+                    error_history=error_history,
+                    latency_ms=total_time,
+                    generation_times_ms=[gen_time, index_time],
+                    explain_times_ms=explain_times,
+                )
+            else:
+                error_history.append(f"Beam {idx}: EXPLAIN failed: {result.error_message}")
+
+        # All candidates failed - return first one
+        total_time = (time.perf_counter() - start_time) * 1000
+        return GenerationResult(
+            sql=candidates[0],
+            valid=False,
+            iterations=num_beams - 1,
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, index_time],
             explain_times_ms=explain_times,
         )
