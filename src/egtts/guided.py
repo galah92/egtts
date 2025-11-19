@@ -311,7 +311,8 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
         plan_str = " ".join(str(row) for row in explain_output).upper()
 
         # Penalties for inefficient operations
-        if "SCAN TABLE" in plan_str:
+        # SQLite EXPLAIN uses "SCAN <table>" not "SCAN TABLE <table>"
+        if "'SCAN " in plan_str and "USING INDEX" not in plan_str:
             cost += 100  # Table scan is expensive
         if "USE TEMP B-TREE" in plan_str:
             cost += 50  # Temporary structures add overhead

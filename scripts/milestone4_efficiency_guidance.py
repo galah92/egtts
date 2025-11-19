@@ -74,7 +74,8 @@ def results_match(results1: list, results2: list) -> bool:
 def has_table_scan(explain_plan: list[dict]) -> bool:
     """Check if query plan contains table scan."""
     plan_str = " ".join(str(row) for row in explain_plan).upper()
-    return "SCAN TABLE" in plan_str
+    # SQLite EXPLAIN uses "SCAN <table>" not "SCAN TABLE <table>"
+    return "'SCAN " in plan_str and "USING INDEX" not in plan_str
 
 
 def evaluate_milestone4(num_examples: int = 50):
