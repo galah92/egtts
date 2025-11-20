@@ -31,14 +31,26 @@ def load_model(
         trust_remote_code=True
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True
-    )
+    # Load directly onto GPU with proper device mapping
+    if device == "cuda":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            device_map="cuda:0",  # Explicit GPU device
+            trust_remote_code=True
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            trust_remote_code=True
+        )
+        model = model.to(device)
+
+    model.eval()  # Set to evaluation mode
 
     print(f"Model loaded successfully. Device: {model.device}")
+    print(f"Model hf_device_map: {getattr(model, 'hf_device_map', 'N/A')}")
     return model, tokenizer
 
 

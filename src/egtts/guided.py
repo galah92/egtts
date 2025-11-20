@@ -535,6 +535,89 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
             )
         gen_time = (time.perf_counter() - gen_start) * 1000
 
+        # Decode all candidates
+        candidates = []
+        for output in outputs:
+            generated_ids = output[input_length:]
+            sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+            # Clean up SQL
+            if "```sql" in sql.lower():
+                sql = sql.split("```sql", 1)[1].split("```")[0].strip()
+            elif "```" in sql:
+                parts = sql.split("```")
+                if len(parts) >= 2:
+                    sql = parts[1].strip()
+
+            lines = sql.split("\n")
+            sql_lines = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("--") and not line.lower().startswith(
+                    ("this query", "the query", "note:")
+                ):
+                    sql_lines.append(line)
+                elif sql_lines:
+                    break
+
+            sql = " ".join(sql_lines).strip()
+            candidates.append(sql)
+
+        # Validate all candidates and collect costs
+        explain_times = []
+        error_history = []
+        valid_candidates = []  # List of (sql, cost, beam_idx)
+
+        for idx, sql in enumerate(candidates):
+            # Check schema first
+            schema_valid, schema_error = self._validate_schema_references(sql, schema_index)
+
+            if not schema_valid:
+                error_history.append(f"Beam {idx}: Schema validation failed: {schema_error}")
+                continue
+
+            # Check with EXPLAIN
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                # Calculate cost
+                cost = self.calculate_plan_cost(result.plan)
+                valid_candidates.append((sql, cost, idx))
+            else:
+                error_history.append(f"Beam {idx}: EXPLAIN failed: {result.error_message}")
+
+        # If we have valid candidates, pick the one with lowest cost
+        if valid_candidates:
+            # Sort by cost (ascending)
+            valid_candidates.sort(key=lambda x: x[1])
+            best_sql, best_cost, best_idx = valid_candidates[0]
+
+            total_time = (time.perf_counter() - start_time) * 1000
+            return GenerationResult(
+                sql=best_sql,
+                valid=True,
+                iterations=best_idx,
+                error_history=error_history,
+                latency_ms=total_time,
+                generation_times_ms=[gen_time, index_time],
+                explain_times_ms=explain_times,
+            )
+
+        # All candidates failed - return first one
+        total_time = (time.perf_counter() - start_time) * 1000
+        return GenerationResult(
+            sql=candidates[0] if candidates else "",
+            valid=False,
+            iterations=num_beams - 1,
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, index_time],
+            explain_times_ms=explain_times,
+        )
+
     def generate_with_confidence_aware_reranking(
         self, question: str, schema: str, db_path: str, num_beams: int = 5,
         confidence_threshold: float = -0.22  # log(0.8) ≈ -0.223
