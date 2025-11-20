@@ -4,6 +4,7 @@ from .data import get_database_path, load_spider
 from .database import ExplainError, ExplainSuccess, explain_query
 from .guided import ExplainGuidedGenerator, GenerationResult
 from .model import create_sql_prompt, generate_sql, load_model
+from .steering import ClauseAwareBeamSearch, generate_with_steering
 
 __all__ = [
     "explain_query",
@@ -16,4 +17,6 @@ __all__ = [
     "generate_sql",
     "ExplainGuidedGenerator",
     "GenerationResult",
+    "ClauseAwareBeamSearch",
+    "generate_with_steering",
 ]

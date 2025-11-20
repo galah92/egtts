@@ -1,25 +1,23 @@
 """
-Test M5 (Confidence-Aware Re-ranking) with different threshold values.
+Test Execution-Guided Steering (EG-SQL) on first 100 Spider examples.
 
-Usage:
-    python scripts/test_m5_threshold.py --threshold 0.05
-    python scripts/test_m5_threshold.py --threshold 0.10
+This tests the new clause-aware beam search approach that validates
+SQL at clause boundaries and prunes invalid beams early.
 """
 
-import argparse
 import json
+import sqlite3
 import time
 from pathlib import Path
 
 from tqdm import tqdm
 
-from egtts import ExplainGuidedGenerator, load_model
+from egtts import load_model
+from egtts.steering import generate_with_steering
 
 
 def get_database_schema(db_path: Path) -> str:
     """Extract CREATE TABLE statements from database."""
-    import sqlite3
-
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -43,10 +41,9 @@ def get_database_schema(db_path: Path) -> str:
         return ""
 
 
-def run_m5_test(threshold: float):
-    """Run M5 on first 100 Spider dev examples with specified threshold."""
+def main():
     print("=" * 80)
-    print(f"M5 (CONFIDENCE-AWARE RE-RANKING) - Threshold={threshold}")
+    print("EG-SQL: EXECUTION-GUIDED STEERING - Test on 100 Examples")
     print("=" * 80)
 
     # Load Spider data
@@ -66,23 +63,21 @@ def run_m5_test(threshold: float):
     model, tokenizer = load_model()
     print("✓ Model loaded")
 
-    # Initialize generator
-    generator = ExplainGuidedGenerator(model, tokenizer)
-    print("✓ Generator initialized")
-
     # Results storage
     results = []
     metadata = []
 
     errors = 0
     total_time = 0.0
+    total_checkpoints = 0
+    total_pruned = 0
 
     print(f"\n{'=' * 80}")
-    print(f"Processing {len(examples)} examples with threshold={threshold}...")
+    print(f"Processing {len(examples)} examples...")
     print(f"{'=' * 80}\n")
 
     # Process examples
-    for idx, example in enumerate(tqdm(examples, desc=f"M5 (t={threshold})")):
+    for idx, example in enumerate(tqdm(examples, desc="EG-SQL Generation")):
         db_id = example["db_id"]
         question = example["question"]
         gold_sql = example["query"]
@@ -121,17 +116,18 @@ def run_m5_test(threshold: float):
             errors += 1
             continue
 
-        # Generate SQL with M5 (Confidence-Aware Re-ranking)
+        # Generate SQL with execution-guided steering
         start_time = time.perf_counter()
 
         try:
-            result = generator.generate_with_confidence_aware_reranking(
-                question, schema, str(db_path),
-                num_beams=5,
-                confidence_threshold=threshold
+            predicted_sql, gen_metadata = generate_with_steering(
+                model, tokenizer, question, schema, str(db_path), num_beams=5
             )
-            predicted_sql = result.sql
             generation_time = (time.perf_counter() - start_time) * 1000
+
+            # Track statistics
+            total_checkpoints += gen_metadata.get("checkpoints", 0)
+            total_pruned += gen_metadata.get("pruned_beams", 0)
 
             metadata.append({
                 "index": idx,
@@ -139,10 +135,8 @@ def run_m5_test(threshold: float):
                 "question": question,
                 "gold_sql": gold_sql,
                 "predicted_sql": predicted_sql,
-                "valid": result.valid,
-                "beam_selected": result.iterations,
-                "error_history": result.error_history,
                 "generation_time_ms": generation_time,
+                **gen_metadata
             })
 
         except Exception as e:
@@ -164,11 +158,8 @@ def run_m5_test(threshold: float):
         results.append(predicted_sql)
         total_time += generation_time
 
-    # Format threshold for filename (e.g., 0.05 -> t005, 0.10 -> t010)
-    threshold_str = f"t{int(threshold * 100):03d}"
-
     # Save results
-    output_file = Path(f"spider_results_m5_{threshold_str}_100.txt")
+    output_file = Path("spider_results_steering_100.txt")
     with open(output_file, "w") as f:
         for sql in results:
             f.write(sql + "\n")
@@ -184,23 +175,30 @@ def run_m5_test(threshold: float):
 
     if successful > 0:
         avg_time = total_time / successful
-        print(f"\nAverage generation time: {avg_time:.1f}ms")
-        print(f"Total time: {total_time/1000:.1f}s")
+        avg_checkpoints = total_checkpoints / successful
+        avg_pruned = total_pruned / successful
+
+        print(f"\nGeneration Statistics:")
+        print(f"  Average time: {avg_time:.1f}ms")
+        print(f"  Average checkpoints: {avg_checkpoints:.1f}")
+        print(f"  Average beams pruned: {avg_pruned:.1f}")
+        print(f"\nTotal time: {total_time/1000:.1f}s")
 
     print(f"\n✓ Results saved to: {output_file}")
 
     # Save metadata
-    metadata_file = Path(f"results/m5_{threshold_str}_test_100_metadata.json")
+    metadata_file = Path("results/steering_100_metadata.json")
     metadata_file.parent.mkdir(parents=True, exist_ok=True)
 
     with open(metadata_file, "w") as f:
         json.dump({
-            "strategy": f"M5 (Confidence-Aware Re-ranking, threshold={threshold})",
-            "threshold": threshold,
+            "strategy": "EG-SQL (Execution-Guided Steering)",
             "total_examples": len(examples),
             "successful": successful,
             "failed": errors,
             "avg_generation_time_ms": total_time / successful if successful > 0 else 0,
+            "avg_checkpoints": total_checkpoints / successful if successful > 0 else 0,
+            "avg_pruned_beams": total_pruned / successful if successful > 0 else 0,
             "total_time_ms": total_time,
             "examples": metadata,
         }, f, indent=2)
@@ -209,25 +207,15 @@ def run_m5_test(threshold: float):
 
     print(f"\n{'=' * 80}")
     print("Next steps:")
-    print(f"1. Run Spider evaluation on {output_file}")
-    print(f"2. Compare accuracy vs other thresholds")
-    print(f"3. Analyze decision patterns in {metadata_file}")
+    print("1. Run Spider evaluation:")
+    print(f"   cd spider_eval && python evaluation.py \\")
+    print(f"     --gold ../dev_gold_100.sql \\")
+    print(f"     --pred ../spider_results_steering_100.txt \\")
+    print(f"     --db ../data/spider/spider_data/database \\")
+    print(f"     --table ../data/spider/spider_data/tables.json \\")
+    print(f"     --etype all")
+    print("2. Compare with M3 baseline (expected: better accuracy)")
     print(f"{'=' * 80}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Test M5 with different confidence thresholds"
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        required=True,
-        help="Confidence threshold (e.g., 0.05, 0.10)"
-    )
-
-    args = parser.parse_args()
-    run_m5_test(args.threshold)
 
 
 if __name__ == "__main__":
