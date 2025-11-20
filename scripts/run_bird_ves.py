@@ -80,6 +80,18 @@ def execute_sql_with_timeout(sql: str, db_path: Path, timeout: float = 30.0) -> 
     try:
         conn = sqlite3.connect(db_path)
         conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+        
+        # Use progress handler to check for timeout
+        # SQLite's PRAGMA busy_timeout only handles lock waits, not execution time.
+        # We need to interrupt long-running queries (e.g. infinite loops) to prevent hangs
+        # during VES benchmarking where we must execute the query to measure performance.
+        def progress_handler():
+            if time.perf_counter() - start_time > timeout:
+                return 1
+            return 0
+            
+        conn.set_progress_handler(progress_handler, 1000)
+        
         cursor = conn.cursor()
 
         cursor.execute(sql)
@@ -89,6 +101,12 @@ def execute_sql_with_timeout(sql: str, db_path: Path, timeout: float = 30.0) -> 
         execution_time = (time.perf_counter() - start_time) * 1000
         return results, execution_time, ""
 
+    except sqlite3.OperationalError as e:
+        if "interrupted" in str(e):
+             execution_time = (time.perf_counter() - start_time) * 1000
+             return None, execution_time, f"Timeout after {timeout}s"
+        execution_time = (time.perf_counter() - start_time) * 1000
+        return None, execution_time, str(e)
     except Exception as e:
         execution_time = (time.perf_counter() - start_time) * 1000
         return None, execution_time, str(e)

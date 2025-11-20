@@ -5,8 +5,8 @@
 A research thesis investigating whether execution-guided steering—a technique that has revolutionized Python code generation—can be applied to SQL generation. Using SQLite's `EXPLAIN QUERY PLAN` as a non-destructive validation signal, we explored real-time query steering and post-hoc validation strategies.
 
 **Model:** Qwen2.5-Coder-7B-Instruct
-**Benchmark:** Spider Development Set (1,034 examples)
-**Status:** Research Phase Complete - Codebase Frozen
+**Benchmarks:** Spider Development Set (1,034 examples) + BIRD Mini-Dev (500 examples)
+**Status:** Research Phase Complete - Final Results Validated
 
 ---
 
@@ -23,7 +23,7 @@ Through four major experimental milestones, we validated the feasibility of real
 
 ## Experimental Results
 
-### Timeline and Accuracy
+### Spider Benchmark (1,034 examples)
 
 | Milestone | Strategy | Accuracy | Avg Time | Status |
 |-----------|----------|----------|----------|--------|
@@ -32,6 +32,23 @@ Through four major experimental milestones, we validated the feasibility of real
 | **M3** | Validation-Guided (Post-Hoc) | **49.8%** | 3.1s | ✅ Working |
 | **M4** | Efficiency-Guided (Cost-Aware) | **49.4%** | ~3s | ✅ Working |
 | **EG-SQL** | Clause-Aware Steering | **49.0%** | 17.1s | ❌ Failed |
+
+### BIRD Mini-Dev Benchmark (500 examples)
+
+**Goal:** Validate efficiency hypothesis on realistic databases (1K-100K rows)
+
+| Strategy | Accuracy | VES | R-VES | Success Rate | Exec Time | Gen Time |
+|----------|----------|-----|-------|--------------|-----------|----------|
+| **Baseline** | **41.8%** | 0.500 | 37.62 | 99.6% | 227.6ms | 4105ms |
+| **M4** | **45.3%** | 0.518 | 38.35 | 93.2% | 235.8ms | 6062ms |
+
+**M4 Improvements:**
+- ✅ **Accuracy:** +8.4% relative (+3.5 pp absolute)
+- ✅ **VES:** +3.6% relative (efficiency validated)
+- ✅ **R-VES:** +1.9% relative (BIRD official metric)
+- ⚠️ **Trade-off:** Higher failure rate (6.8% vs 0.4%), +47.7% generation time
+
+**Key Finding:** Cost-aware selection successfully improves both correctness and efficiency on realistic databases, validating the core efficiency thesis.
 
 ### Key Findings by Milestone
 
@@ -154,15 +171,20 @@ egtts/
 │   └── steering.py         # EG-SQL clause-aware beam search (failed)
 │
 ├── scripts/
-│   ├── benchmark.py        # Unified benchmark runner
+│   ├── benchmark.py        # Spider benchmark runner (M1-M5 strategies)
+│   ├── run_bird_ves.py     # BIRD VES benchmark runner
+│   ├── calculate_rves.py   # R-VES metric calculator (BIRD official)
+│   ├── download_bird.py    # BIRD Mini-Dev dataset downloader
 │   ├── test_steering_100.py # EG-SQL steering test
 │   ├── visualize_steering.py # Steering metrics visualization
-│   └── download_spider.sh  # Dataset download script
+│   └── download_spider.sh  # Spider dataset download script
 │
 ├── results/                # Raw experimental outputs
 │   ├── spider_full_metadata_baseline.json
 │   ├── spider_full_metadata_m3.json
 │   ├── spider_full_metadata_m4.json
+│   ├── bird_ves_baseline_500.json
+│   ├── bird_ves_M4_500.json
 │   └── steering_100_metadata.json
 │
 ├── docs/                   # Research documentation
@@ -192,6 +214,7 @@ bash scripts/download_spider.sh
 
 ### Run Benchmarks
 
+**Spider Benchmark:**
 ```bash
 # Baseline greedy decoding
 uv run python scripts/benchmark.py --dataset spider --strategy baseline --limit 100
@@ -201,6 +224,21 @@ uv run python scripts/benchmark.py --dataset spider --strategy M3 --limit 100
 
 # EG-SQL: Execution-guided steering (experimental - known to fail)
 uv run python scripts/test_steering_100.py
+```
+
+**BIRD VES Benchmark:**
+```bash
+# Download BIRD Mini-Dev dataset
+uv run python scripts/download_bird.py
+
+# Run baseline evaluation
+uv run python scripts/run_bird_ves.py --strategy baseline --data-dir data/bird --output-dir results
+
+# Run M4 cost-aware evaluation
+uv run python scripts/run_bird_ves.py --strategy M4 --data-dir data/bird --output-dir results
+
+# Calculate R-VES (BIRD's official metric)
+python3 scripts/calculate_rves.py
 ```
 
 ### Expected Results (First 100 Examples)
@@ -386,12 +424,14 @@ MIT License - See LICENSE file for details.
 
 ## Final Notes
 
-This thesis concludes the active research phase of EGTTS. The codebase is frozen as of **November 2025** with the following validated conclusions:
+This thesis concludes the active research phase of EGTTS. The codebase is finalized as of **November 2025** with the following validated conclusions:
 
-1. ✅ **EXPLAIN-based validation is feasible** for Text-to-SQL
-2. ✅ **Post-hoc re-ranking (M3) works** for filtering invalid queries
-3. ✅ **Cost-aware re-ranking (M4) works** for identifying efficient plans
+1. ✅ **EXPLAIN-based validation is feasible** for Text-to-SQL (M1: <1ms latency)
+2. ✅ **Post-hoc re-ranking (M3) works** for filtering invalid queries on Spider
+3. ✅ **Cost-aware re-ranking (M4) works** for both correctness and efficiency on BIRD (+8.4% accuracy, +3.6% VES, +1.9% R-VES)
 4. ❌ **Clause-aware steering (EG-SQL) does not work** due to structural incompatibility
+
+**Key Contribution:** BIRD benchmark validates the **efficiency thesis** - cost-aware query selection improves both correctness and execution efficiency on realistic databases (1K-100K rows).
 
 The failure of EG-SQL is not an implementation bug—it is a **negative theoretical result** demonstrating that SQL's declarative nature is fundamentally incompatible with token-level steering. This finding contributes to our understanding of when and where execution-guided techniques can be successfully applied.
 
