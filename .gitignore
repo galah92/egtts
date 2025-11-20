@@ -12,3 +12,21 @@ wheels/
 # Data and results
 data/
 results/
+
+# Temporary result files
+spider_results_*.txt
+eval_output*.txt
+pred_dev*.txt
+gold_dev*.txt
+dev_gold_*.sql
+
+# Experimental analysis files
+*_comparison.md
+*_metrics.md
+
+# Backup files
+*.backup
+*.bak
+
+# Spider evaluation (third-party)
+spider_eval/

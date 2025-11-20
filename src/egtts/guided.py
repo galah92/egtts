@@ -535,10 +535,73 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
             )
         gen_time = (time.perf_counter() - gen_start) * 1000
 
+    def generate_with_confidence_aware_reranking(
+        self, question: str, schema: str, db_path: str, num_beams: int = 5,
+        confidence_threshold: float = -0.22  # log(0.8) ≈ -0.223
+    ) -> GenerationResult:
+        """
+        Generate SQL with confidence-aware re-ranking (Milestone 5 / Strategy M5).
+
+        This balances accuracy and efficiency using model confidence:
+        1. Generate beams and capture sequence scores (log-probs)
+        2. Filter candidates by schema + EXPLAIN validation
+        3. Find Most Probable Valid Beam (highest score)
+        4. Find Most Efficient Valid Beam (lowest cost)
+        5. Decision logic:
+           - Default to Most Probable
+           - Only switch to Efficient if (Score_Probable - Score_Efficient) < THRESHOLD
+
+        This prevents M4's problem of sacrificing high-probability correct answers
+        for low-probability efficient answers.
+
+        Args:
+            question: Natural language question
+            schema: Database schema
+            db_path: Path to SQLite database
+            num_beams: Number of beams to generate (default: 5)
+            confidence_threshold: Maximum allowed confidence gap (default: log(0.8))
+
+        Returns:
+            GenerationResult with confidence-aware selected SQL
+        """
+        import torch
+
+        start_time = time.perf_counter()
+
+        # Build schema index
+        index_start = time.perf_counter()
+        schema_index = build_schema_index(db_path)
+        index_time = (time.perf_counter() - index_start) * 1000
+
+        # Create prompt
+        prompt = create_sql_prompt(question, schema, self.tokenizer)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate beams with scores
+        gen_start = time.perf_counter()
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=256,
+                num_beams=num_beams,
+                num_return_sequences=num_beams,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Extract sequences and scores
+        sequences = outputs.sequences
+        scores = outputs.sequences_scores  # Log-probabilities for each beam
+
         # Decode all candidates
         candidates = []
-        for output in outputs:
-            generated_ids = output[input_length:]
+        for i, seq in enumerate(sequences):
+            generated_ids = seq[input_length:]
             sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
             # Clean up SQL
@@ -566,7 +629,7 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
         # Validate schema and get costs for all candidates
         explain_times = []
         error_history = []
-        valid_candidates = []  # (idx, sql, cost)
+        valid_candidates = []  # (idx, sql, cost, score)
 
         for idx, sql in enumerate(candidates):
             # Schema validation first
@@ -585,22 +648,45 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
             if isinstance(result, ExplainSuccess):
                 # Calculate cost from plan
                 cost = self.calculate_plan_cost(result.plan)
-                valid_candidates.append((idx, sql, cost))
+                # Get beam score (log-probability)
+                score = scores[idx].item()
+                valid_candidates.append((idx, sql, cost, score))
             else:
                 error_history.append(f"Beam {idx}: EXPLAIN failed: {result.error_message}")
 
-        # If we have valid candidates, pick the one with lowest cost
+        # Confidence-aware re-ranking logic
         if valid_candidates:
-            # Sort by cost (lower is better)
-            valid_candidates.sort(key=lambda x: x[2])
-            best_idx, best_sql, best_cost = valid_candidates[0]
+            # Find most probable valid beam (highest score)
+            most_probable = max(valid_candidates, key=lambda x: x[3])
+            prob_idx, prob_sql, prob_cost, prob_score = most_probable
+
+            # Find most efficient valid beam (lowest cost)
+            most_efficient = min(valid_candidates, key=lambda x: x[2])
+            eff_idx, eff_sql, eff_cost, eff_score = most_efficient
+
+            # Decision logic: Default to most probable
+            # Only switch to efficient if confidence gap is small
+            confidence_gap = prob_score - eff_score
+
+            if confidence_gap < confidence_threshold:
+                # Confidence gap is small enough - use efficient beam
+                selected_idx = eff_idx
+                selected_sql = eff_sql
+                selected_cost = eff_cost
+                decision_reason = f"Efficient (gap={confidence_gap:.3f} < {confidence_threshold:.3f})"
+            else:
+                # Confidence gap too large - stick with most probable
+                selected_idx = prob_idx
+                selected_sql = prob_sql
+                selected_cost = prob_cost
+                decision_reason = f"Probable (gap={confidence_gap:.3f} >= {confidence_threshold:.3f})"
 
             total_time = (time.perf_counter() - start_time) * 1000
             return GenerationResult(
-                sql=best_sql,
+                sql=selected_sql,
                 valid=True,
-                iterations=best_idx,  # Which beam was selected
-                error_history=error_history,
+                iterations=selected_idx,  # Which beam was selected
+                error_history=error_history + [f"M5 Decision: {decision_reason}"],
                 latency_ms=total_time,
                 generation_times_ms=[gen_time, index_time],
                 explain_times_ms=explain_times,
