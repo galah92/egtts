@@ -51,6 +51,24 @@ Baseline R-VES: 37.62
 M4 R-VES:       38.35  (+1.9% improvement)
 ```
 
+### 4. Official BIRD Evaluation (Optional)
+
+```bash
+# Setup official evaluation environment (one-time)
+git clone https://github.com/bird-bench/mini_dev.git data/mini_dev_official
+python3 scripts/setup_official_eval.py
+
+# Convert your results to official format
+python3 scripts/convert_to_official_format.py \
+  --input results/bird_ves_baseline_500.json \
+  --output results/official_baseline_500.json
+
+# Run official evaluation (EX, R-VES, Soft F1)
+uv run python scripts/eval_official.py --strategy baseline
+```
+
+This uses BIRD's official evaluation scripts for standardized metrics.
+
 ---
 
 ## Results
@@ -147,15 +165,91 @@ egtts/
 │   └── data.py             # BIRD dataset loading
 │
 ├── scripts/
-│   ├── run_bird_ves.py     # Main benchmark runner
-│   ├── calculate_rves.py   # R-VES metric calculator
-│   └── download_bird.py    # Dataset downloader
+│   ├── run_bird_ves.py                # Main benchmark runner
+│   ├── calculate_rves.py              # R-VES metric calculator
+│   ├── download_bird.py               # Dataset downloader
+│   ├── setup_official_eval.py         # Setup official evaluation
+│   ├── convert_to_official_format.py  # Convert results to official format
+│   └── eval_official.py               # Run official BIRD evaluation
 │
 ├── results/
 │   ├── bird_ves_baseline_500.json  # Baseline results
-│   └── bird_ves_M4_500.json        # M4 results
+│   ├── bird_ves_M4_500.json        # M4 results
+│   └── official_eval/              # Official evaluation results
 │
 └── README.md               # This file
+```
+
+---
+
+## Evaluation Pipeline
+
+### Our Evaluation (Fast, Integrated)
+
+We provide a complete evaluation pipeline that calculates all metrics:
+
+1. **Run Benchmark**: Generates SQL predictions and measures execution times
+   ```bash
+   uv run python scripts/run_bird_ves.py --strategy baseline --limit 500
+   ```
+
+2. **Calculate R-VES**: Computes official BIRD efficiency metric
+   ```bash
+   python3 scripts/calculate_rves.py
+   ```
+
+**Output includes:**
+- Execution Accuracy (EX): Correctness of SQL results
+- R-VES: Reward-based Valid Efficiency Score (0-100, higher is better)
+- VES: Valid Efficiency Score
+- Success Rate: Queries that executed without errors
+- Per-query timing and cost metadata
+
+### Official BIRD Evaluation (For Leaderboard Submission)
+
+To validate results against BIRD's official evaluation scripts:
+
+```bash
+# 1. Setup (one-time)
+git clone https://github.com/bird-bench/mini_dev.git data/mini_dev_official
+python3 scripts/setup_official_eval.py
+uv pip install func-timeout psycopg2-binary pymysql
+
+# 2. Convert format
+python3 scripts/convert_to_official_format.py \
+  --input results/bird_ves_baseline_500.json \
+  --output results/official_baseline_500.json
+
+# 3. Run official evaluation
+uv run python scripts/eval_official.py --strategy baseline
+```
+
+**Outputs:**
+- `results/official_eval/baseline_ex.txt` - Execution Accuracy by difficulty
+- `results/official_eval/baseline_ves.txt` - R-VES by difficulty
+- `results/official_eval/baseline_f1.txt` - Soft F1 Score
+
+### Evaluation Workflow
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 1. Generate Predictions                                  │
+│    run_bird_ves.py → bird_ves_baseline_500.json         │
+└──────────────────┬──────────────────────────────────────┘
+                   │
+     ┌─────────────┴────────────────┐
+     │                              │
+     ▼                              ▼
+┌─────────────────┐         ┌──────────────────────┐
+│ 2a. Our R-VES   │         │ 2b. Official Format  │
+│  calculate_rves │         │  convert_to_official │
+└────────┬────────┘         └──────────┬───────────┘
+         │                             │
+         ▼                             ▼
+    ┌────────┐                  ┌──────────────┐
+    │ Fast   │                  │ eval_official│
+    │ 37.62  │                  │ (validates)  │
+    └────────┘                  └──────────────┘
 ```
 
 ---
