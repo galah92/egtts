@@ -244,12 +244,51 @@ This project explored whether **execution-guided decoding** (successful for Pyth
 
 ---
 
+## BIRD Benchmark Compliance
+
+### What's Allowed Without Disclosure
+
+Our approach complies with BIRD benchmark guidelines. The following are permitted without special disclosure:
+
+✅ **Database Schema**: CREATE TABLE statements and schema structure
+✅ **Evidence/Hints**: Domain knowledge and value descriptions provided with questions
+✅ **Few-Shot Examples**: Question-SQL pairs for in-context learning
+✅ **Full Database Access**: Query execution and validation during inference
+✅ **EXPLAIN Plans**: Execution plan metadata for optimization (our approach)
+✅ **Iterative Refinement**: Error-based feedback loops
+✅ **Multiple Candidates**: Beam search with scale disclosure (Few: 1-7, Many: 8-32, Scale: >32)
+
+### What Requires "Oracle Knowledge" Disclosure
+
+⚠️ **External Domain Knowledge**: Semantic information beyond standard schema/evidence
+⚠️ **Database-Specific Hints**: Custom annotations not in original dataset
+
+### Our Classification
+
+This work uses **no oracle knowledge**. Our M4 strategy uses:
+- Standard schema (allowed)
+- EXPLAIN QUERY PLAN metadata (execution information, not domain knowledge)
+- Post-hoc candidate selection (allowed)
+
+**Key Finding**: EXPLAIN-based optimization is execution metadata, not semantic oracle knowledge, and is permitted under BIRD's evaluation framework.
+
+### References
+
+- [BIRD Benchmark Homepage](https://bird-bench.github.io/)
+- [BIRD Paper (NeurIPS 2023)](https://arxiv.org/abs/2305.03111) - Li et al., "Can LLM Already Serve as A Database Interface?"
+- [BIRD Mini-Dev Dataset](https://github.com/bird-bench/mini_dev) - 500-example subset with R-VES evaluation
+- [R-VES Metric Code](https://github.com/bird-bench/mini_dev/blob/main/evaluation/evaluation_ves.py) - Official efficiency evaluation
+- [Submission Guidelines](https://bird-bench.github.io/) - Contact bird.bench23@gmail.com for test evaluation
+
+---
+
 ## Future Work
 
 1. **Reduce failure rate**: Add execution validation with timeout before final selection
 2. **Improve R-VES gains**: Tune cost penalties (SCAN, temp B-tree) or add learned features
 3. **Multi-database support**: Extend to PostgreSQL EXPLAIN ANALYZE, MySQL EXPLAIN
 4. **Scale evaluation**: Test on full BIRD Dev set (1,534 examples)
+5. **Prompt-level guidance**: Add EXPLAIN hints to generation prompts (not yet tested)
 
 ---
 
