@@ -255,7 +255,7 @@ def run_plan_voting(
     schema: str,
     evidence: str,
     db_path: Path,
-    num_samples: int = 10,
+    num_samples: int = 15,  # Increased for better consensus
 ) -> tuple[str, dict]:
     """Run M7 strategy (Plan-Based Majority Voting for accuracy)."""
     start_time = time.perf_counter()
@@ -273,13 +273,33 @@ def run_plan_voting(
 
     generation_time = (time.perf_counter() - start_time) * 1000
 
+    # Parse vote stats from error_history for consensus analysis
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            # Extract the dict part
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
     metadata = {
         "generation_time_ms": generation_time,
         "strategy": "M7",
         "valid": result.valid,
-        "votes": result.iterations,  # iterations stores vote count for M7
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "unique_signatures": vote_stats.get("unique_signatures", 0),
         "latency_ms": result.latency_ms,
-        "error_history": result.error_history,
     }
 
     return result.sql, metadata
@@ -440,6 +460,13 @@ def run_ves_benchmark(
                 "pred_exec_time_ms": pred_time_ms,
                 "generation_time_ms": gen_metadata["generation_time_ms"],
             }
+
+            # Add M7-specific consensus metrics
+            if strategy == "M7":
+                example_result["consensus_confidence"] = gen_metadata.get("consensus_confidence", 0)
+                example_result["votes"] = gen_metadata.get("votes", 0)
+                example_result["valid_candidates"] = gen_metadata.get("valid_candidates", 0)
+                example_result["unique_signatures"] = gen_metadata.get("unique_signatures", 0)
 
             if pred_error:
                 example_result["execution_error"] = pred_error
