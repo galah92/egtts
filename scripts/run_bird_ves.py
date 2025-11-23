@@ -149,9 +149,14 @@ def run_baseline(
     """Run baseline strategy (greedy decoding)."""
     start_time = time.perf_counter()
 
-    # Create prompt with evidence hint
-    prompt_text = f"Question: {question}\nHint: {evidence}\n\nSchema:\n{schema}"
-    prompt = create_sql_prompt(prompt_text, "", generator.tokenizer, few_shot_examples=few_shot_examples)
+    # Create prompt with proper structure
+    prompt = create_sql_prompt(
+        question=question,
+        schema=schema,
+        tokenizer=generator.tokenizer,
+        evidence=evidence if evidence else None,
+        few_shot_examples=few_shot_examples
+    )
 
     from egtts.model import generate_sql
     sql = generate_sql(

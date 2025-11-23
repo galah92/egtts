@@ -54,7 +54,13 @@ def load_model(
     return model, tokenizer
 
 
-def create_sql_prompt(question: str, schema: str, tokenizer=None, few_shot_examples: list = None) -> str | list:
+def create_sql_prompt(
+    question: str,
+    schema: str,
+    tokenizer=None,
+    evidence: str = None,
+    few_shot_examples: list = None
+) -> str | list:
     """
     Create a prompt for SQL generation given a question and database schema.
 
@@ -64,20 +70,22 @@ def create_sql_prompt(question: str, schema: str, tokenizer=None, few_shot_examp
         question: Natural language question
         schema: Database schema (CREATE TABLE statements)
         tokenizer: Tokenizer to apply chat template (optional)
+        evidence: Optional hint/evidence for the query
         few_shot_examples: Optional list of (question, evidence, sql) tuples for few-shot prompting
 
     Returns:
         Formatted prompt string or messages list
     """
-    # Original prompt format (proven to work well)
-    user_message = f"""Given the following database schema:
+    # Build prompt with clear structure
+    parts = [f"Given the following database schema:\n\n{schema}"]
 
-{schema}
+    if evidence:
+        parts.append(f"\nHint: {evidence}")
 
-Generate a SQL query to answer this question:
-{question}
+    parts.append(f"\nGenerate a SQL query to answer this question:\n{question}")
+    parts.append("\nReturn only the SQL query, without any explanation or markdown formatting.")
 
-Return only the SQL query, without any explanation or markdown formatting."""
+    user_message = "\n".join(parts)
 
     messages = [
         {"role": "user", "content": user_message}
