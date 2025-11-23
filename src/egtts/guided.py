@@ -786,3 +786,178 @@ Generate a corrected SQL query that fixes this error. Return only the SQL query,
             generation_times_ms=[gen_time, index_time],
             explain_times_ms=explain_times,
         )
+
+    def generate_with_explain_feedback(
+        self, question: str, schema: str, db_path: str, max_iterations: int = 2
+    ) -> GenerationResult:
+        """
+        Generate SQL with EXPLAIN feedback in the prompt.
+
+        This strategy:
+        1. Generate initial SQL
+        2. Run EXPLAIN QUERY PLAN to get the execution plan
+        3. If the plan shows inefficiencies (table scans), ask the model to optimize
+        4. Repeat until efficient or max iterations reached
+
+        The key insight is that the model can understand EXPLAIN output and
+        suggest optimizations like adding appropriate WHERE clauses or using
+        indexed columns.
+
+        Args:
+            question: Natural language question
+            schema: Database schema
+            db_path: Path to SQLite database
+            max_iterations: Maximum optimization iterations (default: 2)
+
+        Returns:
+            GenerationResult with optimized SQL
+        """
+        start_time = time.perf_counter()
+
+        error_history = []
+        generation_times = []
+        explain_times = []
+
+        # Initial generation
+        gen_start = time.perf_counter()
+        prompt = create_sql_prompt(question, schema, self.tokenizer)
+        current_sql = generate_sql(self.model, self.tokenizer, prompt, max_new_tokens=256, do_sample=False)
+        generation_times.append((time.perf_counter() - gen_start) * 1000)
+
+        # Get initial EXPLAIN
+        explain_start = time.perf_counter()
+        result = explain_query(current_sql, db_path)
+        explain_times.append((time.perf_counter() - explain_start) * 1000)
+
+        # If initial query has errors, try to fix them first
+        if not isinstance(result, ExplainSuccess):
+            error_history.append(f"Initial error: {result.error_message}")
+            # Use the existing refine method to fix errors
+            gen_start = time.perf_counter()
+            current_sql = self.refine(question, schema, current_sql, result.error_message)
+            generation_times.append((time.perf_counter() - gen_start) * 1000)
+
+            # Re-check
+            explain_start = time.perf_counter()
+            result = explain_query(current_sql, db_path)
+            explain_times.append((time.perf_counter() - explain_start) * 1000)
+
+            if not isinstance(result, ExplainSuccess):
+                # Still invalid, return what we have
+                total_time = (time.perf_counter() - start_time) * 1000
+                return GenerationResult(
+                    sql=current_sql,
+                    valid=False,
+                    iterations=1,
+                    error_history=error_history,
+                    latency_ms=total_time,
+                    generation_times_ms=generation_times,
+                    explain_times_ms=explain_times,
+                )
+
+        # Now we have a valid query - check if it needs optimization
+        for iteration in range(max_iterations):
+            # Calculate cost from current plan
+            cost = self.calculate_plan_cost(result.plan)
+
+            # Format the EXPLAIN output for the prompt
+            plan_text = self._format_explain_plan(result.plan)
+
+            # If query is already efficient (no table scans), we're done
+            if cost == 0:
+                error_history.append(f"Iteration {iteration}: Query already efficient (cost=0)")
+                break
+
+            error_history.append(f"Iteration {iteration}: Cost={cost}, attempting optimization")
+
+            # Ask model to optimize based on EXPLAIN output
+            gen_start = time.perf_counter()
+            optimized_sql = self._optimize_with_explain(
+                question, schema, current_sql, plan_text, cost
+            )
+            generation_times.append((time.perf_counter() - gen_start) * 1000)
+
+            # Verify the optimized query
+            explain_start = time.perf_counter()
+            new_result = explain_query(optimized_sql, db_path)
+            explain_times.append((time.perf_counter() - explain_start) * 1000)
+
+            if isinstance(new_result, ExplainSuccess):
+                new_cost = self.calculate_plan_cost(new_result.plan)
+                if new_cost < cost:
+                    # Optimization improved efficiency
+                    error_history.append(f"Optimization successful: cost {cost} -> {new_cost}")
+                    current_sql = optimized_sql
+                    result = new_result
+                    cost = new_cost
+                else:
+                    # No improvement, keep original
+                    error_history.append(f"Optimization did not improve (new cost={new_cost})")
+            else:
+                # Optimized query is invalid, keep original
+                error_history.append(f"Optimized query invalid: {new_result.error_message}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        return GenerationResult(
+            sql=current_sql,
+            valid=True,
+            iterations=len(generation_times) - 1,
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=generation_times,
+            explain_times_ms=explain_times,
+        )
+
+    def _format_explain_plan(self, plan: list[dict]) -> str:
+        """Format EXPLAIN QUERY PLAN output as readable text."""
+        lines = []
+        for row in plan:
+            detail = row.get("detail", "")
+            lines.append(f"  {detail}")
+        return "\n".join(lines)
+
+    def _optimize_with_explain(
+        self, question: str, schema: str, current_sql: str, plan_text: str, cost: int
+    ) -> str:
+        """
+        Ask the model to optimize SQL based on EXPLAIN output.
+
+        Args:
+            question: Original question
+            schema: Database schema
+            current_sql: Current SQL query
+            plan_text: Formatted EXPLAIN output
+            cost: Current cost score
+
+        Returns:
+            Optimized SQL query
+        """
+        # Build optimization prompt
+        optimization_prompt = f"""Given the following database schema:
+
+{schema}
+
+You generated this SQL query to answer "{question}":
+{current_sql}
+
+The EXPLAIN QUERY PLAN output shows:
+{plan_text}
+
+This query has efficiency issues:
+- SCAN operations without index usage indicate full table scans
+- These are slow on large tables
+
+Please rewrite the query to be more efficient. Consider:
+1. Using indexed columns in WHERE clauses
+2. Adding appropriate filters to reduce scanned rows
+3. Using JOINs more efficiently
+
+Return only the optimized SQL query, without explanation."""
+
+        messages = [{"role": "user", "content": optimization_prompt}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        sql = generate_sql(self.model, self.tokenizer, prompt, max_new_tokens=256, do_sample=False)
+        return sql

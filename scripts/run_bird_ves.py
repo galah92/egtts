@@ -214,6 +214,41 @@ def run_m4_cost_aware(
     return result.sql, metadata
 
 
+def run_explain_feedback(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+) -> tuple[str, dict]:
+    """Run explain_feedback strategy (EXPLAIN output pushed to prompt for optimization)."""
+    start_time = time.perf_counter()
+
+    # Create prompt with evidence hint in question
+    question_with_hint = f"{question}\nHint: {evidence}" if evidence else question
+
+    # Generate using explain_feedback strategy
+    result = generator.generate_with_explain_feedback(
+        question_with_hint,
+        schema,
+        str(db_path),
+        max_iterations=2
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "explain_feedback",
+        "valid": result.valid,
+        "iterations": result.iterations,
+        "latency_ms": result.latency_ms,
+        "error_history": result.error_history,
+    }
+
+    return result.sql, metadata
+
+
 def run_ves_benchmark(
     data_dir: Path,
     strategy: str = "baseline",
@@ -317,6 +352,10 @@ def run_ves_benchmark(
             elif strategy == "M4":
                 pred_sql, gen_metadata = run_m4_cost_aware(
                     generator, question, schema, evidence, db_path, num_beams
+                )
+            elif strategy == "explain_feedback":
+                pred_sql, gen_metadata = run_explain_feedback(
+                    generator, question, schema, evidence, db_path
                 )
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
