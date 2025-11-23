@@ -25,7 +25,8 @@ def run_evaluation(strategy: str, metric: str = "all"):
     # Paths
     project_root = Path(__file__).parent.parent
     eval_dir = project_root / "data" / "mini_dev_official" / "evaluation"
-    db_root = project_root / "data" / "mini_dev_official" / "sqlite" / "dev_databases"
+    # NOTE: db_root must end with '/' for BIRD's path construction
+    db_root = str(project_root / "data" / "mini_dev_official" / "sqlite" / "dev_databases") + "/"
     ground_truth = project_root / "data" / "mini_dev_official" / "sqlite" / "mini_dev_sqlite_gold.sql"
     diff_json = project_root / "data" / "mini_dev_official" / "sqlite" / "mini_dev_sqlite.jsonl"
     pred_path = project_root / "results" / f"official_{strategy}_500.json"
@@ -72,7 +73,7 @@ def run_evaluation(strategy: str, metric: str = "all"):
         cmd = [
             sys.executable,  # Use current Python interpreter
             str(script),
-            "--db_root_path", str(db_root),
+            "--db_root_path", db_root,
             "--predicted_sql_path", str(pred_path),
             "--ground_truth_path", str(ground_truth),
             "--diff_json_path", str(diff_json),
