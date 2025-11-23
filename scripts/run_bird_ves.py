@@ -249,6 +249,42 @@ def run_explain_feedback(
     return result.sql, metadata
 
 
+def run_plan_voting(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 10,
+) -> tuple[str, dict]:
+    """Run M7 strategy (Plan-Based Majority Voting for accuracy)."""
+    start_time = time.perf_counter()
+
+    # Create prompt with evidence hint in question
+    question_with_hint = f"{question}\nHint: {evidence}" if evidence else question
+
+    # Generate using plan voting strategy
+    result = generator.generate_with_plan_voting(
+        question_with_hint,
+        schema,
+        str(db_path),
+        num_samples=num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M7",
+        "valid": result.valid,
+        "votes": result.iterations,  # iterations stores vote count for M7
+        "latency_ms": result.latency_ms,
+        "error_history": result.error_history,
+    }
+
+    return result.sql, metadata
+
+
 def run_ves_benchmark(
     data_dir: Path,
     strategy: str = "baseline",
@@ -355,6 +391,10 @@ def run_ves_benchmark(
                 )
             elif strategy == "explain_feedback":
                 pred_sql, gen_metadata = run_explain_feedback(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M7":
+                pred_sql, gen_metadata = run_plan_voting(
                     generator, question, schema, evidence, db_path
                 )
             else:

@@ -961,3 +961,122 @@ Return only the optimized SQL query, without explanation."""
 
         sql = generate_sql(self.model, self.tokenizer, prompt, max_new_tokens=256, do_sample=False)
         return sql
+
+    def generate_with_plan_voting(
+        self, question: str, schema: str, db_path: str, num_samples: int = 10
+    ) -> GenerationResult:
+        """
+        Generate SQL with Plan-Based Majority Voting (M7).
+
+        This strategy uses EXPLAIN signatures for semantic self-consistency:
+        1. Generate K diverse SQL candidates (using sampling)
+        2. Get EXPLAIN QUERY PLAN for each valid candidate
+        3. Normalize plans into abstract signatures
+        4. Vote: find the most common plan signature
+        5. Select: from candidates with winning signature, pick lowest cost
+
+        Key insight: Different SQL syntax can produce identical execution plans.
+        By voting on plans instead of SQL strings, we achieve semantic consensus
+        that filters out hallucinations and syntax variations.
+
+        Args:
+            question: Natural language question
+            schema: Database schema
+            db_path: Path to SQLite database
+            num_samples: Number of diverse samples to generate (default: 10)
+
+        Returns:
+            GenerationResult with consensus-selected SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Create prompt
+        prompt = create_sql_prompt(question, schema, self.tokenizer)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates using sampling (not beam search)
+        # We need diversity to get different plans
+        gen_start = time.perf_counter()
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=256,
+                num_return_sequences=num_samples,
+                do_sample=True,
+                temperature=0.7,  # Some randomness for diversity
+                top_p=0.95,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Decode all candidates
+        candidates = []
+        for output in outputs:
+            generated_ids = output[input_length:]
+            sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+            # Clean up SQL
+            if "```sql" in sql.lower():
+                sql = sql.split("```sql", 1)[1].split("```")[0].strip()
+            elif "```" in sql:
+                parts = sql.split("```")
+                if len(parts) >= 2:
+                    sql = parts[1].strip()
+
+            lines = sql.split("\n")
+            sql_lines = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("--") and not line.lower().startswith(
+                    ("this query", "the query", "note:")
+                ):
+                    sql_lines.append(line)
+                elif sql_lines:
+                    break
+
+            sql = " ".join(sql_lines).strip()
+            candidates.append(sql)
+
+        # Get plan signatures for all candidates
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []  # (sql, signature, cost)
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                error_history.append(f"Candidate {idx}: {result.error_message}")
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Perform plan-based majority voting
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+
+        # Determine if we got a valid result
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),  # Use votes as "iterations"
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time],
+            explain_times_ms=explain_times,
+        )
