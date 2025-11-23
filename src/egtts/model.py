@@ -69,37 +69,19 @@ def create_sql_prompt(question: str, schema: str, tokenizer=None, few_shot_examp
     Returns:
         Formatted prompt string or messages list
     """
-    # Build system message with instructions
-    system_message = """You are an expert SQL query generator. Given a database schema and a natural language question, generate the correct SQL query to answer the question.
+    # Original prompt format (proven to work well)
+    user_message = f"""Given the following database schema:
 
-Rules:
-- Return ONLY the SQL query, no explanations
-- Use proper SQL syntax for SQLite
-- Use table aliases when joining multiple tables"""
-
-    messages = [{"role": "system", "content": system_message}]
-
-    # Add few-shot examples if provided
-    if few_shot_examples:
-        for ex_question, ex_evidence, ex_sql in few_shot_examples:
-            # User turn with example question
-            if ex_evidence:
-                user_content = f"Question: {ex_question}\nHint: {ex_evidence}"
-            else:
-                user_content = f"Question: {ex_question}"
-            messages.append({"role": "user", "content": user_content})
-            # Assistant turn with example SQL
-            messages.append({"role": "assistant", "content": ex_sql})
-
-    # Final user message with target question and schema
-    user_message = f"""Database schema:
 {schema}
 
-Question: {question}
+Generate a SQL query to answer this question:
+{question}
 
-SQL query:"""
+Return only the SQL query, without any explanation or markdown formatting."""
 
-    messages.append({"role": "user", "content": user_message})
+    messages = [
+        {"role": "user", "content": user_message}
+    ]
 
     if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
         prompt = tokenizer.apply_chat_template(
