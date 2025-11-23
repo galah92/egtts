@@ -305,6 +305,118 @@ def run_plan_voting(
     return result.sql, metadata
 
 
+def run_massive_diversity(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 32,
+) -> tuple[str, dict]:
+    """Run M8 strategy (Massive Diversity Plan-Bagging)."""
+    start_time = time.perf_counter()
+
+    # Create prompt with evidence hint in question
+    question_with_hint = f"{question}\nHint: {evidence}" if evidence else question
+
+    # Generate using massive diversity strategy
+    result = generator.generate_with_massive_diversity(
+        question_with_hint,
+        schema,
+        str(db_path),
+        num_samples=num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M8",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "unique_signatures": vote_stats.get("unique_signatures", 0),
+        "syntax_errors": vote_stats.get("syntax_errors", 0),
+        "schema_errors": vote_stats.get("schema_errors", 0),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
+def run_few_shot_simulation(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 32,
+) -> tuple[str, dict]:
+    """Run M9 strategy (Few-Shot + Simulation Filter)."""
+    start_time = time.perf_counter()
+
+    # Generate using few-shot + simulation strategy
+    result = generator.generate_with_few_shot_and_simulation(
+        question,
+        schema,
+        str(db_path),
+        hint=evidence,
+        num_samples=num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M9",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "unique_signatures": vote_stats.get("unique_signatures", 0),
+        "filtered_by_simulation": vote_stats.get("filtered_by_simulation", 0),
+        "expects_singular": vote_stats.get("expects_singular", False),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
 def run_ves_benchmark(
     data_dir: Path,
     strategy: str = "baseline",
@@ -415,6 +527,14 @@ def run_ves_benchmark(
                 )
             elif strategy == "M7":
                 pred_sql, gen_metadata = run_plan_voting(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M8":
+                pred_sql, gen_metadata = run_massive_diversity(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M9":
+                pred_sql, gen_metadata = run_few_shot_simulation(
                     generator, question, schema, evidence, db_path
                 )
             else:

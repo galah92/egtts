@@ -10,6 +10,7 @@ from sqlglot import exp
 from .database import ExplainSuccess, explain_query
 from .model import create_sql_prompt, generate_sql
 from .schema import SchemaIndex, build_schema_index
+from .prompts import format_few_shot_prompt, detect_singular_intent
 
 
 @dataclass
@@ -962,6 +963,96 @@ Return only the optimized SQL query, without explanation."""
         sql = generate_sql(self.model, self.tokenizer, prompt, max_new_tokens=256, do_sample=False)
         return sql
 
+    def _generate_diverse_samples(
+        self, inputs, input_length: int, num_samples: int, temperature: float = 0.7
+    ) -> tuple[list[str], float]:
+        """
+        Generate diverse SQL samples with OOM-safe batching.
+
+        If generating all samples at once causes OOM, falls back to batching.
+
+        Args:
+            inputs: Tokenized inputs
+            input_length: Length of input tokens
+            num_samples: Number of samples to generate
+            temperature: Sampling temperature
+
+        Returns:
+            Tuple of (list of SQL candidates, generation time in ms)
+        """
+        import torch
+
+        gen_start = time.perf_counter()
+
+        try:
+            # Try to generate all at once
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    num_return_sequences=num_samples,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.95,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+        except torch.cuda.OutOfMemoryError:
+            # OOM - fall back to batching
+            torch.cuda.empty_cache()
+            outputs_list = []
+            batch_size = num_samples // 2  # Half the samples per batch
+
+            for _ in range(2):
+                with torch.no_grad():
+                    batch_outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=256,
+                        num_return_sequences=batch_size,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+                outputs_list.append(batch_outputs)
+                torch.cuda.empty_cache()
+
+            # Concatenate batches
+            outputs = torch.cat(outputs_list, dim=0)
+
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Decode all candidates
+        candidates = []
+        for output in outputs:
+            generated_ids = output[input_length:]
+            sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+            # Clean up SQL
+            if "```sql" in sql.lower():
+                sql = sql.split("```sql", 1)[1].split("```")[0].strip()
+            elif "```" in sql:
+                parts = sql.split("```")
+                if len(parts) >= 2:
+                    sql = parts[1].strip()
+
+            lines = sql.split("\n")
+            sql_lines = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("--") and not line.lower().startswith(
+                    ("this query", "the query", "note:")
+                ):
+                    sql_lines.append(line)
+                elif sql_lines:
+                    break
+
+            sql = " ".join(sql_lines).strip()
+            candidates.append(sql)
+
+        return candidates, gen_time
+
     def generate_with_plan_voting(
         self, question: str, schema: str, db_path: str, num_samples: int = 10
     ) -> GenerationResult:
@@ -999,48 +1090,7 @@ Return only the optimized SQL query, without explanation."""
         input_length = inputs["input_ids"].shape[1]
 
         # Generate diverse candidates using sampling (not beam search)
-        # We need diversity to get different plans
-        gen_start = time.perf_counter()
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=256,
-                num_return_sequences=num_samples,
-                do_sample=True,
-                temperature=0.7,  # Some randomness for diversity
-                top_p=0.95,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        gen_time = (time.perf_counter() - gen_start) * 1000
-
-        # Decode all candidates
-        candidates = []
-        for output in outputs:
-            generated_ids = output[input_length:]
-            sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-            # Clean up SQL
-            if "```sql" in sql.lower():
-                sql = sql.split("```sql", 1)[1].split("```")[0].strip()
-            elif "```" in sql:
-                parts = sql.split("```")
-                if len(parts) >= 2:
-                    sql = parts[1].strip()
-
-            lines = sql.split("\n")
-            sql_lines = []
-            for line in lines:
-                line = line.strip()
-                if line and not line.startswith("--") and not line.lower().startswith(
-                    ("this query", "the query", "note:")
-                ):
-                    sql_lines.append(line)
-                elif sql_lines:
-                    break
-
-            sql = " ".join(sql_lines).strip()
-            candidates.append(sql)
+        candidates, gen_time = self._generate_diverse_samples(inputs, input_length, num_samples)
 
         # Get plan signatures for all candidates
         explain_times = []
@@ -1075,6 +1125,212 @@ Return only the optimized SQL query, without explanation."""
             sql=winning_sql,
             valid=valid,
             iterations=vote_stats.get("winning_votes", 0),  # Use votes as "iterations"
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time],
+            explain_times_ms=explain_times,
+        )
+
+    def generate_with_massive_diversity(
+        self, question: str, schema: str, db_path: str, num_samples: int = 32
+    ) -> GenerationResult:
+        """
+        Generate SQL with Massive Diversity Plan-Bagging (M8).
+
+        This strategy scales up M7 with more diverse samples:
+        1. Generate N=32 diverse SQL candidates using temperature sampling
+        2. Validate all candidates with EXPLAIN (filter syntax/schema errors)
+        3. Cluster valid candidates by Plan Signature
+        4. Vote: identify the largest cluster (most common plan)
+        5. Select: from winning cluster, pick lowest cost query
+
+        Key insights:
+        - Hallucinations are "fragile" - they generate unique, weird plans
+        - Correct answers are "stable" - multiple samples converge on same plan
+        - More samples = higher chance of finding the correct "stable" cluster
+
+        This is similar to Pass@K scaling but uses plan consensus instead of
+        oracle/ground-truth comparison.
+
+        Args:
+            question: Natural language question
+            schema: Database schema
+            db_path: Path to SQLite database
+            num_samples: Number of diverse samples (default: 32)
+
+        Returns:
+            GenerationResult with consensus-selected SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Create prompt
+        prompt = create_sql_prompt(question, schema, self.tokenizer)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates with OOM-safe batching
+        # Use temperature=0.7 for good diversity without being too random
+        candidates, gen_time = self._generate_diverse_samples(
+            inputs, input_length, num_samples, temperature=0.7
+        )
+
+        # Validate and get plan signatures for all candidates
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []  # (sql, signature, cost)
+        syntax_errors = 0
+        schema_errors = 0
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                # Track error types for analysis
+                error_msg = result.error_message.lower()
+                if "syntax" in error_msg:
+                    syntax_errors += 1
+                elif "no such table" in error_msg or "no such column" in error_msg:
+                    schema_errors += 1
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Perform plan-based majority voting
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Enhanced stats for M8
+        vote_stats["syntax_errors"] = syntax_errors
+        vote_stats["schema_errors"] = schema_errors
+        vote_stats["num_samples"] = num_samples
+
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+
+        # Determine if we got a valid result
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time],
+            explain_times_ms=explain_times,
+        )
+
+    def generate_with_few_shot_and_simulation(
+        self, question: str, schema: str, db_path: str, hint: str = None, num_samples: int = 32
+    ) -> GenerationResult:
+        """
+        Generate SQL with Few-Shot Prompting + Simulation Filter (M9).
+
+        This is the "Final Squeeze" strategy combining:
+        1. Few-Shot Prompting: Domain-specific examples for BIRD patterns
+        2. Diverse Generation: Temperature sampling for N candidates
+        3. EXPLAIN Validation: Filter invalid queries
+        4. Simulation Filter: Reject "chatty" queries that return wrong column count
+        5. Plan-Based Voting: Select from consensus cluster
+
+        Addresses two failure modes:
+        - Generation Failures (80%): Few-shot teaches SUBSTR, GROUP BY patterns
+        - Selection Failures (20%): Simulation filter kills chatty beams
+
+        Args:
+            question: Natural language question
+            schema: Database schema
+            db_path: Path to SQLite database
+            hint: Optional evidence/hint
+            num_samples: Number of candidates to generate
+
+        Returns:
+            GenerationResult with selected SQL
+        """
+        import torch
+        import sqlite3
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Use few-shot prompt instead of standard prompt
+        prompt = format_few_shot_prompt(
+            question, schema, self.tokenizer, hint=hint, use_few_shot=True
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates
+        candidates, gen_time = self._generate_diverse_samples(
+            inputs, input_length, num_samples, temperature=0.7
+        )
+
+        # Detect if question expects singular output (for simulation filter)
+        expects_singular = detect_singular_intent(question)
+
+        # Validate candidates with EXPLAIN + Simulation Filter
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+        filtered_by_simulation = 0
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                # Simulation Filter: Check column count
+                if expects_singular:
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        # Run on empty result set to check column structure
+                        cursor.execute(f"SELECT * FROM ({sql}) LIMIT 0")
+                        num_cols = len(cursor.description) if cursor.description else 0
+                        conn.close()
+
+                        # Filter: If singular expected but >1 column, kill the beam
+                        if num_cols > 1:
+                            filtered_by_simulation += 1
+                            candidates_with_plans.append((sql, "FILTERED_CHATTY", -1))
+                            continue
+                    except Exception:
+                        pass  # If we can't check, don't filter
+
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Perform plan-based voting (excluding filtered candidates)
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Enhanced stats
+        vote_stats["filtered_by_simulation"] = filtered_by_simulation
+        vote_stats["expects_singular"] = expects_singular
+        vote_stats["num_samples"] = num_samples
+        vote_stats["strategy"] = "M9_FewShot_Simulation"
+
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig not in ("ERROR", "FILTERED_CHATTY") and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
             error_history=error_history,
             latency_ms=total_time,
             generation_times_ms=[gen_time],
