@@ -144,13 +144,14 @@ def run_baseline(
     question: str,
     schema: str,
     evidence: str,
+    few_shot_examples: list = None,
 ) -> tuple[str, dict]:
     """Run baseline strategy (greedy decoding)."""
     start_time = time.perf_counter()
 
     # Create prompt with evidence hint
     prompt_text = f"Question: {question}\nHint: {evidence}\n\nSchema:\n{schema}"
-    prompt = create_sql_prompt(prompt_text, "", generator.tokenizer)
+    prompt = create_sql_prompt(prompt_text, "", generator.tokenizer, few_shot_examples=few_shot_examples)
 
     from egtts.model import generate_sql
     sql = generate_sql(
@@ -164,9 +165,10 @@ def run_baseline(
     generation_time = (time.perf_counter() - start_time) * 1000
 
     metadata = {
-        "strategy": "baseline",
+        "strategy": "baseline" if not few_shot_examples else f"few_shot_{len(few_shot_examples)}",
         "generation_time_ms": generation_time,
         "num_beams": 1,
+        "num_few_shot": len(few_shot_examples) if few_shot_examples else 0,
     }
 
     return sql, metadata
@@ -299,6 +301,14 @@ def run_ves_benchmark(
                 pred_sql, gen_metadata = run_baseline(
                     generator, question, schema, evidence
                 )
+            elif strategy.startswith("few_shot"):
+                # Parse number of examples from strategy name (e.g., "few_shot_3")
+                num_shots = int(strategy.split("_")[-1]) if "_" in strategy else 3
+                from egtts.few_shot import get_few_shot_examples
+                few_shot_examples = get_few_shot_examples(num_shots)
+                pred_sql, gen_metadata = run_baseline(
+                    generator, question, schema, evidence, few_shot_examples=few_shot_examples
+                )
             elif strategy == "M4":
                 pred_sql, gen_metadata = run_m4_cost_aware(
                     generator, question, schema, evidence, db_path, num_beams
@@ -429,9 +439,9 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=["baseline", "M4", "both"],
+        type=str,
         default="both",
-        help="Strategy to evaluate (baseline, M4, or both)"
+        help="Strategy: baseline, M4, few_shot_3, few_shot_5, or both"
     )
     parser.add_argument(
         "--limit",
