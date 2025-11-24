@@ -277,12 +277,33 @@ BIRD's official efficiency metric with tiered rewards:
 
 ---
 
+## Model Size Experiments
+
+We tested whether larger models improve accuracy with quantization to fit in GPU memory.
+
+### 14B Model with Quantization (50 examples)
+
+| Model | Quantization | Accuracy | VES | Time/Example | Memory | Status |
+|-------|--------------|----------|-----|--------------|---------|---------|
+| 7B | FP16 | 62.0% | 0.596 | 14s | 14GB | ✅ Default |
+| 14B | 8-bit | - | - | - | 21GB+ | ❌ OOM during loading |
+| 14B | 4-bit | 64.0% | 0.775 | 37s | 14GB | ✅ Works but slow |
+
+**Findings:**
+- **14B with 4-bit quantization works** on L4 GPU (23GB VRAM)
+- **+2% accuracy improvement** (62% → 64%), **+30% VES** (0.596 → 0.775)
+- **2.7x slower inference** (14s → 37s per example)
+- **Not recommended** for default use due to minimal accuracy gain vs significant speed cost
+
+---
+
 ## Limitations
 
 1. **Generation ceiling**: 80% of failures have no correct SQL in 32 samples
 2. **Compute cost**: M8 is ~3× slower than baseline (32 samples vs 1)
 3. **SQLite-specific**: Plan analysis uses SQLite's EXPLAIN format
-4. **7B model limit**: Larger models might benefit less from diversity
+4. **7B model optimal**: Larger models provide minimal accuracy gain (+2%) at high cost (2.7x slower)
+5. **Quantization required**: 14B models need 4-bit quantization to fit in 23GB VRAM
 
 ---
 
@@ -292,7 +313,7 @@ BIRD's official efficiency metric with tiered rewards:
 2. **Hybrid approaches**: Use M8 diversity with M9-style targeted examples
 3. **Weighted voting**: Weight votes by model confidence or plan cost
 4. **Error recovery**: When all samples fail, fall back to repair strategy
-5. **Cross-model**: Test if diversity scaling works for larger models
+5. **Distillation**: Distill 14B model knowledge into faster 7B model
 
 ---
 

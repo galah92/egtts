@@ -1,43 +1,66 @@
 """Model loading and inference utilities for Text-to-SQL generation."""
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 def load_model(
     model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.float16,
+    quantization: str = None
 ):
     """
-    Load Qwen2.5-Coder model and tokenizer.
+    Load Qwen2.5-Coder model and tokenizer with optional quantization.
 
-    The model is loaded in FP16 to fit in NVIDIA L4 24GB VRAM:
-    - Model: ~14GB (7B params × 2 bytes)
-    - Remaining: ~10GB for context and generation
+    Quantization options:
+    - None (default): FP16 - 7B uses ~14GB, 14B uses ~28GB
+    - "8bit": 8-bit quantization - 7B uses ~7GB, 14B uses ~14GB
+    - "4bit": 4-bit quantization - 7B uses ~3.5GB, 14B uses ~7GB
 
     Args:
         model_name: HuggingFace model identifier
         device: Device to load model on ("cuda" or "cpu")
-        dtype: Model dtype (default: float16 for efficiency)
+        dtype: Model dtype (default: float16 for efficiency, ignored if quantized)
+        quantization: Quantization mode ("8bit", "4bit", or None)
 
     Returns:
         Tuple of (model, tokenizer)
     """
-    print(f"Loading {model_name} on {device}...")
+    quant_str = f" with {quantization} quantization" if quantization else ""
+    print(f"Loading {model_name} on {device}{quant_str}...")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True
     )
 
+    # Prepare quantization config if requested
+    quantization_config = None
+    if quantization == "8bit":
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    elif quantization == "4bit":
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True
+        )
+
     # Load directly onto GPU with proper device mapping
     if device == "cuda":
+        load_kwargs = {
+            "device_map": "cuda:0",
+            "trust_remote_code": True
+        }
+        if quantization_config:
+            load_kwargs["quantization_config"] = quantization_config
+        else:
+            load_kwargs["torch_dtype"] = dtype
+
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=dtype,
-            device_map="cuda:0",  # Explicit GPU device
-            trust_remote_code=True
+            **load_kwargs
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(

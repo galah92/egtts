@@ -695,6 +695,8 @@ def run_ves_benchmark(
     limit: int | None = None,
     num_beams: int = 5,
     output_dir: Path = Path("results"),
+    model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    quantization: str = None,
 ) -> dict:
     """
     Run VES benchmark on BIRD Mini-Dev.
@@ -705,6 +707,8 @@ def run_ves_benchmark(
         limit: Limit number of examples (None = all)
         num_beams: Number of beams for M4 strategy
         output_dir: Directory for output files
+        model_name: HuggingFace model identifier
+        quantization: Quantization mode ("8bit", "4bit", or None)
 
     Returns:
         Results dictionary with VES metrics
@@ -719,7 +723,7 @@ def run_ves_benchmark(
 
     # Load model
     print("Loading model...")
-    model, tokenizer = load_model()
+    model, tokenizer = load_model(model_name=model_name, quantization=quantization)
     generator = ExplainGuidedGenerator(model, tokenizer)
 
     results = {
@@ -983,6 +987,19 @@ def main():
         default=Path("results"),
         help="Output directory for results"
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2.5-Coder-7B-Instruct",
+        help="HuggingFace model identifier (default: 7B)"
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        choices=["8bit", "4bit", None],
+        default=None,
+        help="Quantization mode: 8bit, 4bit, or None (default: None/FP16)"
+    )
 
     args = parser.parse_args()
 
@@ -999,6 +1016,8 @@ def main():
             limit=args.limit,
             num_beams=args.num_beams,
             output_dir=args.output_dir,
+            model_name=args.model,
+            quantization=args.quantization,
         )
         all_results[strategy] = results
 
