@@ -25,6 +25,7 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 | M11 | 30.0% | 0.702 | Chain-of-thought (failed - batch errors) |
 | M12 | 58.0% | 0.557 | Execution-based self-correction |
 | M14 | 34.0% | 0.505 | Data Flow CoT (failed - batch errors) |
+| M15 | 42.0% | - | Incremental consensus (failed - error propagation) |
 
 ### Full Benchmark (500 examples)
 
@@ -93,6 +94,16 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 - Same tensor size mismatch errors as M11 (36% failure rate)
 - Hypothesis disproven: Execution-order planning doesn't help 7B models
 
+### M15: Incremental Consensus Generation (MAKER) - Failed Experiment
+- Decomposes SQL into 3 atomic phases with voting at each stage (36 calls per query)
+- Phase 1: Table Selection (FROM/JOIN) with EXPLAIN validation - locks table scope
+- Phase 2: Filter Generation (WHERE) with string voting - locks filter logic
+- Phase 3: Projection (SELECT/GROUP BY) with plan voting - completes query
+- Uses M10's augmented schema + M7's plan voting
+- **Hypothesis:** By locking tables via consensus first, we prevent column hallucinations
+- **Result:** 42% accuracy - **10% worse than M10 (52%)**
+- **Why it failed:** SQL generation is holistic, not decomposable. Phase 1 added unnecessary JOINs (9/12 consensus on wrong tables). Errors propagated through phases. Context loss between phases hurt semantics (e.g., missed `/12` for monthly averages). 2.4x slower with worse accuracy.
+
 ---
 
 ## Quick Start
@@ -143,6 +154,9 @@ uv run python scripts/run_bird_ves.py \
 
 # M14 (data flow chain-of-thought)
 --strategy M14
+
+# M15 (incremental consensus - MAKER)
+uv run python scripts/run_bird_m15.py --limit 50 --samples-per-phase 12
 ```
 
 ---
