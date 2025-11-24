@@ -528,6 +528,60 @@ def run_cot(
     return result.sql, metadata
 
 
+def run_execution_correction(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 15,
+) -> tuple[str, dict]:
+    """Run M12 strategy (Execution-Based Self-Correction)."""
+    start_time = time.perf_counter()
+
+    # Generate using execution correction strategy
+    result = generator.generate_with_execution_correction(
+        question,
+        str(db_path),
+        hint=evidence,
+        num_samples=num_samples,
+        max_corrections=2,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M12",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "corrections_needed": vote_stats.get("corrections_needed", 0),
+        "result_rows": vote_stats.get("result_rows", 0),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
 def run_augmented_schema(
     generator: ExplainGuidedGenerator,
     question: str,
@@ -709,6 +763,10 @@ def run_ves_benchmark(
                 )
             elif strategy == "M11":
                 pred_sql, gen_metadata = run_cot(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M12":
+                pred_sql, gen_metadata = run_execution_correction(
                     generator, question, schema, evidence, db_path
                 )
             elif strategy == "M13":

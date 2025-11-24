@@ -1644,3 +1644,176 @@ Return only the optimized SQL query, without explanation."""
             generation_times_ms=[gen_time, schema_time],
             explain_times_ms=explain_times,
         )
+
+    def generate_with_execution_correction(
+        self, question: str, db_path: str, hint: str = None, num_samples: int = 15, max_corrections: int = 2
+    ) -> GenerationResult:
+        """
+        Generate SQL with Execution-Based Self-Correction (M12).
+
+        This strategy uses actual query execution results as feedback:
+        1. Generate candidates using augmented schema (from M10)
+        2. Plan-based voting selects the consensus answer
+        3. Execute the winning query on the actual database
+        4. If result is empty/error: feedback to regenerate
+        5. Repeat until non-empty result or max corrections
+
+        Key insight: Many semantic errors produce syntactically valid but
+        logically wrong queries that return 0 rows. By checking if the
+        query returns data, we catch these errors.
+
+        This addresses failures like:
+        - Missing JOINs (returns empty due to no matching rows)
+        - Wrong filter conditions (filters everything out)
+        - Incorrect aggregations (returns NULL/empty)
+
+        Args:
+            question: Natural language question
+            db_path: Path to SQLite database
+            hint: Optional hint/evidence from BIRD
+            num_samples: Number of diverse samples (default: 15)
+            max_corrections: Maximum correction iterations (default: 2)
+
+        Returns:
+            GenerationResult with execution-verified SQL
+        """
+        import torch
+        import sqlite3
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        error_history = []
+        all_generation_times = []
+        all_explain_times = []
+        correction_count = 0
+
+        # Build the question with hint
+        full_question = question
+        if hint:
+            full_question = f"{question}\n\nHint: {hint}"
+
+        # Get augmented schema with sample rows
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+        all_generation_times.append(schema_time)
+
+        previous_attempts = []  # Store failed queries for feedback
+
+        while correction_count <= max_corrections:
+            # Create prompt - add feedback about previous failures if any
+            if previous_attempts:
+                feedback_section = "\n\nPREVIOUS ATTEMPTS (returned empty/no results - please try a different approach):\n"
+                for i, (sql, reason) in enumerate(previous_attempts[-2:], 1):  # Show last 2 attempts
+                    feedback_section += f"Attempt {i}: {sql}\nProblem: {reason}\n"
+                prompt_question = full_question + feedback_section
+            else:
+                prompt_question = full_question
+
+            prompt = create_sql_prompt(prompt_question, augmented_schema, self.tokenizer)
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            input_length = inputs["input_ids"].shape[1]
+
+            # Generate diverse candidates
+            candidates, gen_time = self._generate_diverse_samples(
+                inputs, input_length, num_samples, temperature=0.7
+            )
+            all_generation_times.append(gen_time)
+
+            # Validate and get plan signatures
+            explain_times = []
+            candidates_with_plans = []
+
+            for idx, sql in enumerate(candidates):
+                explain_start = time.perf_counter()
+                result = explain_query(sql, db_path)
+                explain_time = (time.perf_counter() - explain_start) * 1000
+                explain_times.append(explain_time)
+
+                if isinstance(result, ExplainSuccess):
+                    signature = normalize_plan(result.plan)
+                    cost = self.calculate_plan_cost(result.plan)
+                    candidates_with_plans.append((sql, signature, cost))
+                else:
+                    candidates_with_plans.append((sql, "ERROR", -1))
+
+            all_explain_times.extend(explain_times)
+
+            # Perform plan-based majority voting
+            winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+            # If no valid candidates, try again or give up
+            if winning_sig == "ERROR" or vote_stats.get("valid_candidates", 0) == 0:
+                error_history.append(f"Correction {correction_count}: No valid candidates")
+                correction_count += 1
+                previous_attempts.append((winning_sql, "Syntax or schema error"))
+                continue
+
+            # Execute the winning query to check if it returns results
+            try:
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute(winning_sql)
+                rows = cursor.fetchall()
+                conn.close()
+
+                row_count = len(rows)
+
+                # Check for empty or null results
+                if row_count == 0:
+                    error_history.append(f"Correction {correction_count}: Query returned 0 rows")
+                    previous_attempts.append((winning_sql, "Returned 0 rows - likely missing JOIN or wrong filter"))
+                    correction_count += 1
+                    continue
+
+                # Check if all values are NULL
+                if row_count == 1 and all(v is None for v in rows[0]):
+                    error_history.append(f"Correction {correction_count}: Query returned all NULL")
+                    previous_attempts.append((winning_sql, "Returned NULL - likely wrong aggregation"))
+                    correction_count += 1
+                    continue
+
+                # Success! Query returned actual data
+                error_history.append(f"Success after {correction_count} corrections: {row_count} rows returned")
+                vote_stats["strategy"] = "M12_ExecutionCorrection"
+                vote_stats["corrections_needed"] = correction_count
+                vote_stats["result_rows"] = row_count
+                error_history.append(f"Vote stats: {vote_stats}")
+
+                total_time = (time.perf_counter() - start_time) * 1000
+
+                return GenerationResult(
+                    sql=winning_sql,
+                    valid=True,
+                    iterations=vote_stats.get("winning_votes", 0),
+                    error_history=error_history,
+                    latency_ms=total_time,
+                    generation_times_ms=all_generation_times,
+                    explain_times_ms=all_explain_times,
+                )
+
+            except Exception as e:
+                error_history.append(f"Correction {correction_count}: Execution error: {str(e)}")
+                previous_attempts.append((winning_sql, f"Execution error: {str(e)}"))
+                correction_count += 1
+                continue
+
+        # Max corrections reached - return last attempt
+        error_history.append(f"Max corrections ({max_corrections}) reached")
+        vote_stats["strategy"] = "M12_ExecutionCorrection"
+        vote_stats["corrections_needed"] = correction_count
+        vote_stats["result_rows"] = 0
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=True,  # Syntactically valid even if semantically wrong
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=all_generation_times,
+            explain_times_ms=all_explain_times,
+        )

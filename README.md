@@ -2,10 +2,10 @@
 
 **Improving SQL Query Accuracy Through Plan-Based Consensus Voting**
 
-A research project exploring inference-time scaling for Text-to-SQL. We achieve **60% accuracy** on BIRD Mini-Dev (up from 41.6% baseline) using plan-based majority voting with diverse candidate generation.
+A research project exploring inference-time scaling for Text-to-SQL. We achieve **53.6% accuracy** on BIRD Mini-Dev (up from 41.6% baseline) using schema augmentation with plan-based majority voting.
 
 **Model:** Qwen2.5-Coder-7B-Instruct
-**Best Strategy:** M8 (Massive Diversity Plan-Bagging)
+**Best Strategy:** M10 (Schema Augmentation + Plan Voting)
 **Dataset:** BIRD Mini-Dev (500 examples with realistic databases)
 
 ---
@@ -19,8 +19,11 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 | Baseline | 41.6% | 0.416 | Greedy decoding |
 | M4 | 45.3% | 0.518 | Cost-aware beam selection |
 | M7 | 59.0% | 0.557 | Plan-based voting (5 beams) |
-| **M8** | **60.0%** | 0.544 | **Massive diversity (32 samples)** |
+| M8 | 60.0% | 0.544 | Massive diversity (32 samples) |
 | M9 | 52.0% | 0.476 | Few-shot + simulation filter |
+| **M10** | **62.0%** | 0.596 | **Schema augmentation + plan voting** |
+| M11 | 30.0% | 0.702 | Chain-of-thought (failed - batch errors) |
+| M12 | 58.0% | 0.557 | Execution-based self-correction |
 
 ### Full Benchmark (500 examples)
 
@@ -28,8 +31,9 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 |----------|----------|-----|-------|
 | Baseline | 41.8% | 0.500 | 37.62 |
 | M7 | 51.2% | 0.472 | - |
+| **M10** | **53.6%** | 0.506 | - |
 
-**Best improvement: +18.4 percentage points** (41.6% → 60.0%)
+**Best improvement: +12.0 percentage points** (41.6% → 53.6%)
 
 ---
 
@@ -60,6 +64,26 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 - Simulation filter for "chatty" queries (wrong column count)
 - **Result:** -8% vs M8 (few-shot hurt performance)
 
+### M10: Schema Augmentation (Best - 53.6%)
+- Include sample data rows in the prompt (3 rows per table)
+- Helps model understand actual data formats (e.g., Date='201301' not '2013-01-01')
+- Plan-based majority voting on top
+- **Result:** +2.4% over M7 (51.2% → 53.6%)
+
+### M11: Chain-of-Thought (Failed Experiment)
+- Force structured reasoning before SQL generation
+- Uses "-- Reasoning:" followed by "-- SQL:" format
+- **Result:** Failed due to tensor size mismatch errors in batch generation
+- Variable-length CoT prompts incompatible with batching
+- Only 30% accuracy (vs 62% M10) on 50 examples
+
+### M12: Execution-Based Self-Correction
+- Execute queries and check if results are empty
+- If 0 rows returned: provide feedback and regenerate
+- Up to 2 correction iterations
+- **Result:** 58% accuracy - slightly worse than M10 (62%)
+- Most failures return data (just wrong data), so execution check doesn't help
+
 ---
 
 ## Quick Start
@@ -71,11 +95,11 @@ uv sync
 uv run python scripts/download_bird.py
 ```
 
-### Run Best Strategy (M8)
+### Run Best Strategy (M10)
 
 ```bash
 uv run python scripts/run_bird_ves.py \
-  --strategy M8 \
+  --strategy M10 \
   --limit 50 \
   --data-dir data/bird \
   --output-dir results
@@ -93,11 +117,20 @@ uv run python scripts/run_bird_ves.py \
 # M7 (plan-based voting, 5 beams)
 --strategy M7
 
-# M8 (massive diversity, 32 samples) - BEST
+# M8 (massive diversity, 32 samples)
 --strategy M8
 
 # M9 (few-shot + simulation)
 --strategy M9
+
+# M10 (schema augmentation) - BEST
+--strategy M10
+
+# M11 (chain-of-thought)
+--strategy M11
+
+# M12 (execution-based self-correction)
+--strategy M12
 ```
 
 ---
@@ -169,10 +202,10 @@ egtts/
 ├── src/egtts/
 │   ├── model.py         # Model loading, SQL generation
 │   ├── database.py      # EXPLAIN QUERY PLAN analysis
-│   ├── guided.py        # All strategies (M4-M9)
+│   ├── guided.py        # All strategies (M4-M12)
 │   ├── plans.py         # Plan normalization and voting
-│   ├── prompts.py       # Few-shot prompting (M9)
-│   └── schema.py        # Schema utilities
+│   ├── prompts.py       # Few-shot prompting and CoT (M9, M11)
+│   └── schema.py        # Schema utilities and augmentation (M10)
 │
 ├── scripts/
 │   ├── run_bird_ves.py              # Main benchmark runner
@@ -203,6 +236,8 @@ egtts/
 1. **Few-shot prompting (M9)**: Domain-specific examples hurt generalization (-8%)
 2. **Simulation filter**: Column count validation was too aggressive
 3. **Token-level steering**: SQL's declarative structure incompatible with real-time intervention
+4. **Chain-of-thought (M11)**: Variable-length reasoning broke batch generation, 30% accuracy
+5. **Execution correction (M12)**: Most wrong queries return data, so empty-result check doesn't help
 
 ### Scientific Conclusion
 
