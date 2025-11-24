@@ -124,3 +124,100 @@ def build_schema_index(db_path: str | Path) -> SchemaIndex:
         columns=columns_by_table,
         all_columns=all_columns,
     )
+
+
+def get_augmented_schema(
+    db_path: str | Path,
+    max_rows_per_table: int = 3,
+    max_schema_chars: int = 8000
+) -> str:
+    """
+    Generate augmented schema with sample rows for each table.
+
+    This helps the model understand:
+    - Actual data formats (e.g., Date='201301' not '2013-01-01')
+    - Column value patterns
+    - Data relationships
+
+    Args:
+        db_path: Path to SQLite database
+        max_rows_per_table: Number of sample rows to include (default: 3)
+        max_schema_chars: Maximum schema length before truncating samples (default: 8000)
+
+    Returns:
+        Augmented schema string with CREATE statements and sample data
+    """
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    # Get all tables with their CREATE statements
+    cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
+    tables = cursor.fetchall()
+
+    schema_parts = []
+
+    for table_name, create_stmt in tables:
+        if create_stmt is None:
+            continue
+
+        # Add CREATE statement
+        schema_parts.append(create_stmt)
+
+        # Get column names
+        cursor.execute(f"PRAGMA table_info(`{table_name}`)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if not columns:
+            schema_parts.append("")
+            continue
+
+        # Get sample rows
+        try:
+            cursor.execute(f"SELECT * FROM `{table_name}` LIMIT {max_rows_per_table}")
+            rows = cursor.fetchall()
+
+            if rows:
+                # Format as comment with sample data
+                schema_parts.append(f"-- Sample data from {table_name}:")
+                col_header = ", ".join(columns)
+                schema_parts.append(f"-- Columns: {col_header}")
+
+                for row in rows:
+                    # Format values, handling None and strings
+                    formatted_values = []
+                    for val in row:
+                        if val is None:
+                            formatted_values.append("NULL")
+                        elif isinstance(val, str):
+                            # Truncate long strings
+                            val_str = val[:50] + "..." if len(val) > 50 else val
+                            formatted_values.append(f"'{val_str}'")
+                        else:
+                            formatted_values.append(str(val))
+                    schema_parts.append(f"-- Example: ({', '.join(formatted_values)})")
+        except Exception as e:
+            schema_parts.append(f"-- (Could not fetch samples: {e})")
+
+        schema_parts.append("")  # Blank line between tables
+
+    conn.close()
+
+    result = "\n".join(schema_parts)
+
+    # If schema is too large, fall back to just CREATE statements (no samples)
+    if len(result) > max_schema_chars:
+        # Rebuild without sample data
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = cursor.fetchall()
+        conn.close()
+
+        schema_parts = []
+        for table_name, create_stmt in tables:
+            if create_stmt is not None:
+                schema_parts.append(create_stmt)
+                schema_parts.append("")
+        result = "\n".join(schema_parts)
+
+    return result

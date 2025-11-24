@@ -9,7 +9,7 @@ from sqlglot import exp
 
 from .database import ExplainSuccess, explain_query
 from .model import create_sql_prompt, generate_sql
-from .schema import SchemaIndex, build_schema_index
+from .schema import SchemaIndex, build_schema_index, get_augmented_schema
 from .prompts import format_few_shot_prompt, detect_singular_intent
 
 
@@ -1334,5 +1334,174 @@ Return only the optimized SQL query, without explanation."""
             error_history=error_history,
             latency_ms=total_time,
             generation_times_ms=[gen_time],
+            explain_times_ms=explain_times,
+        )
+
+    def generate_with_augmented_schema(
+        self, question: str, db_path: str, num_samples: int = 15
+    ) -> GenerationResult:
+        """
+        Generate SQL with Schema Augmentation (M10).
+
+        This strategy enhances the prompt with sample data from each table,
+        helping the model understand:
+        - Actual data formats (e.g., Date='201301' not '2013-01-01')
+        - Column value patterns and ranges
+        - Data relationships between tables
+
+        Uses plan-based majority voting on top of the augmented schema.
+
+        Args:
+            question: Natural language question (may include hint)
+            db_path: Path to SQLite database
+            num_samples: Number of diverse samples to generate (default: 15)
+
+        Returns:
+            GenerationResult with consensus-selected SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Get augmented schema with sample rows
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+
+        # Create prompt with augmented schema
+        prompt = create_sql_prompt(question, augmented_schema, self.tokenizer)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates
+        candidates, gen_time = self._generate_diverse_samples(
+            inputs, input_length, num_samples, temperature=0.7
+        )
+
+        # Validate and get plan signatures
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Perform plan-based majority voting
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Add M10-specific metadata
+        vote_stats["strategy"] = "M10_AugmentedSchema"
+        vote_stats["schema_augmentation_time_ms"] = schema_time
+        vote_stats["num_samples"] = num_samples
+
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, schema_time],
+            explain_times_ms=explain_times,
+        )
+
+    def generate_with_augmented_schema_and_probing(
+        self, question: str, db_path: str, num_samples: int = 15
+    ) -> GenerationResult:
+        """
+        Generate SQL with Schema Augmentation + Data Probing (M13).
+
+        This combines M10's schema augmentation with literal probing:
+        1. Augmented schema helps model understand data formats
+        2. Generate diverse candidates with plan voting
+        3. Probe string literals to detect hallucinations
+        4. Demote clusters with non-existent values
+
+        Args:
+            question: Natural language question (may include hint)
+            db_path: Path to SQLite database
+            num_samples: Number of diverse samples to generate (default: 15)
+
+        Returns:
+            GenerationResult with probe-verified SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan_with_probing
+
+        start_time = time.perf_counter()
+
+        # Get augmented schema with sample rows
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+
+        # Create prompt with augmented schema
+        prompt = create_sql_prompt(question, augmented_schema, self.tokenizer)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates
+        candidates, gen_time = self._generate_diverse_samples(
+            inputs, input_length, num_samples, temperature=0.7
+        )
+
+        # Validate and get plan signatures
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Perform plan-based voting WITH probing
+        probe_start = time.perf_counter()
+        winning_sql, winning_sig, vote_stats = vote_by_plan_with_probing(
+            candidates_with_plans, db_path
+        )
+        probe_time = (time.perf_counter() - probe_start) * 1000
+
+        # Add M13-specific metadata
+        vote_stats["strategy"] = "M13_AugmentedSchema_Probing"
+        vote_stats["schema_augmentation_time_ms"] = schema_time
+        vote_stats["probing_time_ms"] = probe_time
+        vote_stats["num_samples"] = num_samples
+
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, schema_time, probe_time],
             explain_times_ms=explain_times,
         )

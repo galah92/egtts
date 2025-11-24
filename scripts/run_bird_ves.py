@@ -417,6 +417,116 @@ def run_few_shot_simulation(
     return result.sql, metadata
 
 
+def run_augmented_schema_with_probing(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 15,
+) -> tuple[str, dict]:
+    """Run M13 strategy (Schema Augmentation + Data Probing)."""
+    start_time = time.perf_counter()
+
+    # Create prompt with evidence hint in question
+    question_with_hint = f"{question}\nHint: {evidence}" if evidence else question
+
+    # Generate using augmented schema + probing strategy
+    result = generator.generate_with_augmented_schema_and_probing(
+        question_with_hint,
+        str(db_path),
+        num_samples=num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M13",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "unique_signatures": vote_stats.get("unique_signatures", 0),
+        "probing_stats": vote_stats.get("probing_stats", {}),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
+def run_augmented_schema(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 15,
+) -> tuple[str, dict]:
+    """Run M10 strategy (Schema Augmentation with sample data)."""
+    start_time = time.perf_counter()
+
+    # Create prompt with evidence hint in question
+    question_with_hint = f"{question}\nHint: {evidence}" if evidence else question
+
+    # Generate using augmented schema strategy
+    result = generator.generate_with_augmented_schema(
+        question_with_hint,
+        str(db_path),
+        num_samples=num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M10",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "unique_signatures": vote_stats.get("unique_signatures", 0),
+        "schema_augmentation_time_ms": vote_stats.get("schema_augmentation_time_ms", 0),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
 def run_ves_benchmark(
     data_dir: Path,
     strategy: str = "baseline",
@@ -535,6 +645,14 @@ def run_ves_benchmark(
                 )
             elif strategy == "M9":
                 pred_sql, gen_metadata = run_few_shot_simulation(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M10":
+                pred_sql, gen_metadata = run_augmented_schema(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M13":
+                pred_sql, gen_metadata = run_augmented_schema_with_probing(
                     generator, question, schema, evidence, db_path
                 )
             else:
