@@ -159,3 +159,176 @@ def count_expected_columns(question: str) -> int:
         return 1
 
     return -1  # Unknown
+
+
+# Chain-of-Thought few-shot examples with reasoning
+COT_FEW_SHOT_EXAMPLES = [
+    # Example 1: "Highest monthly" requires GROUP BY + SUM + ORDER
+    {
+        "question": "What is the highest monthly consumption in the year 2012?",
+        "hint": "The first 4 strings of the Date values can represent year; The 5th and 6th string can refer to month.",
+        "reasoning": """1. Tables needed: yearmonth (contains Date and Consumption)
+2. "Monthly consumption" means I need to SUM consumption grouped by month
+3. "Highest monthly" means ORDER BY the SUM descending and LIMIT 1
+4. Year 2012 filter: SUBSTR(Date, 1, 4) = '2012'
+5. Month extraction: SUBSTR(Date, 5, 2)""",
+        "sql": "SELECT SUM(Consumption) FROM yearmonth WHERE SUBSTR(Date, 1, 4) = '2012' GROUP BY SUBSTR(Date, 5, 2) ORDER BY SUM(Consumption) DESC LIMIT 1"
+    },
+    # Example 2: Missing JOIN pattern - need to link through intermediate table
+    {
+        "question": "Which customers in the LAM segment had transactions at gas stations in CZE?",
+        "hint": "LAM is a segment; CZE is a country code.",
+        "reasoning": """1. Tables needed: customers (for Segment), transactions_1k (links customer to gas station), gasstations (for Country)
+2. JOIN path: customers -> transactions_1k (on CustomerID) -> gasstations (on GasStationID)
+3. Filter: Segment = 'LAM' AND Country = 'CZE'
+4. Return: DISTINCT CustomerID to avoid duplicates""",
+        "sql": "SELECT DISTINCT T1.CustomerID FROM customers AS T1 INNER JOIN transactions_1k AS T2 ON T1.CustomerID = T2.CustomerID INNER JOIN gasstations AS T3 ON T2.GasStationID = T3.GasStationID WHERE T1.Segment = 'LAM' AND T3.Country = 'CZE'"
+    },
+    # Example 3: COUNT(*) vs COUNT(DISTINCT) clarity
+    {
+        "question": "How many transactions were made by customers who pay in EUR?",
+        "hint": "EUR is a Currency value.",
+        "reasoning": """1. Tables needed: customers (for Currency), transactions_1k (for counting transactions)
+2. JOIN: customers -> transactions_1k on CustomerID
+3. "How many transactions" = COUNT(*) of transaction records (not COUNT(DISTINCT CustomerID))
+4. Filter: Currency = 'EUR'""",
+        "sql": "SELECT COUNT(*) FROM transactions_1k AS T1 INNER JOIN customers AS T2 ON T1.CustomerID = T2.CustomerID WHERE T2.Currency = 'EUR'"
+    },
+]
+
+
+def format_cot_prompt(
+    question: str,
+    schema: str,
+    tokenizer=None,
+    hint: str = None,
+) -> str:
+    """
+    Create a Chain-of-Thought prompt that forces reasoning before SQL.
+
+    The model must output:
+    -- Reasoning:
+    1. Tables needed: ...
+    2. JOIN path: ...
+    3. Aggregation logic: ...
+    -- SQL:
+    SELECT ...
+
+    Args:
+        question: Natural language question
+        schema: Database schema with sample data (augmented schema)
+        tokenizer: Tokenizer for chat template
+        hint: Optional hint/evidence
+
+    Returns:
+        Formatted prompt string
+    """
+    messages = []
+
+    # System message enforcing CoT structure
+    system_content = """You are a SQL expert. Generate SQLite queries based on the database schema and question.
+
+IMPORTANT: You MUST think step-by-step before writing SQL.
+
+Output format (REQUIRED):
+-- Reasoning:
+1. Tables needed: [list tables and why]
+2. JOIN path: [how tables connect]
+3. Aggregation: [GROUP BY? SUM/COUNT/MAX? ORDER BY?]
+4. Key insight: [what makes this query tricky]
+-- SQL:
+[Your SQL query here]
+
+Critical SQLite patterns:
+- Dates are YYYYMMDD strings: use SUBSTR(Date, 1, 4) for year, SUBSTR(Date, 5, 2) for month
+- "Highest/lowest monthly X" = GROUP BY month, ORDER BY SUM(X), LIMIT 1
+- "How many transactions" = COUNT(*), "How many customers" = COUNT(DISTINCT CustomerID)
+- Always check if you need intermediate JOINs to connect tables"""
+
+    messages.append({"role": "system", "content": system_content})
+
+    # Add CoT few-shot examples
+    for ex in COT_FEW_SHOT_EXAMPLES:
+        user_msg = f"Question: {ex['question']}"
+        if ex.get('hint'):
+            user_msg += f"\nHint: {ex['hint']}"
+        messages.append({"role": "user", "content": user_msg})
+
+        # Assistant shows reasoning then SQL
+        assistant_msg = f"""-- Reasoning:
+{ex['reasoning']}
+-- SQL:
+{ex['sql']}"""
+        messages.append({"role": "assistant", "content": assistant_msg})
+
+    # Final user question with augmented schema
+    final_user = f"""Given the database schema and sample data below:
+
+{schema}
+
+Question: {question}"""
+
+    if hint:
+        final_user += f"\nHint: {hint}"
+
+    messages.append({"role": "user", "content": final_user})
+
+    # Apply chat template
+    if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        return prompt
+
+    return messages
+
+
+def extract_sql_from_cot(response: str) -> str:
+    """
+    Extract SQL from a Chain-of-Thought response.
+
+    The response format is:
+    -- Reasoning:
+    ...
+    -- SQL:
+    SELECT ...
+
+    Args:
+        response: Full model response with reasoning and SQL
+
+    Returns:
+        Extracted SQL query
+    """
+    import re
+
+    # Try to find SQL after "-- SQL:" marker
+    sql_marker_match = re.search(r'--\s*SQL:\s*\n?(.*)', response, re.IGNORECASE | re.DOTALL)
+    if sql_marker_match:
+        sql = sql_marker_match.group(1).strip()
+        # Clean up: remove trailing comments or extra content
+        # Take first complete SQL statement
+        lines = []
+        for line in sql.split('\n'):
+            line = line.strip()
+            if line.startswith('--') and not line.upper().startswith('-- SQL'):
+                continue  # Skip comment lines after SQL
+            if line:
+                lines.append(line)
+            # Stop if we hit another section marker
+            if line.startswith('--') and 'reasoning' in line.lower():
+                break
+        sql = ' '.join(lines)
+        # Remove any trailing semicolons and whitespace
+        sql = sql.rstrip(';').strip()
+        if sql:
+            return sql
+
+    # Fallback: look for SELECT statement
+    select_match = re.search(r'(SELECT\s+.+?)(?:;|\Z)', response, re.IGNORECASE | re.DOTALL)
+    if select_match:
+        return select_match.group(1).strip()
+
+    # Last resort: return the whole response
+    return response.strip()
