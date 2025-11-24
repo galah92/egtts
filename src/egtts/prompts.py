@@ -332,3 +332,170 @@ def extract_sql_from_cot(response: str) -> str:
 
     # Last resort: return the whole response
     return response.strip()
+
+
+# Data Flow examples - showing execution order (FROM → WHERE → GROUP BY → SELECT)
+DATAFLOW_FEW_SHOT_EXAMPLES = [
+    {
+        "question": "Which customer had the highest total consumption in 2012?",
+        "hint": "Year 2012 can be presented as Between 201201 And 201212.",
+        "plan": """-- 1. Source Tables: yearmonth (contains CustomerID, Date, Consumption)
+-- 2. Filter Conditions: SUBSTR(Date, 1, 4) = '2012' (year 2012)
+-- 3. Aggregation: GROUP BY CustomerID, ORDER BY SUM(Consumption) DESC, LIMIT 1
+-- 4. Final Projection: CustomerID (the customer with highest total)""",
+        "sql": "SELECT CustomerID FROM yearmonth WHERE SUBSTR(Date, 1, 4) = '2012' GROUP BY CustomerID ORDER BY SUM(Consumption) DESC LIMIT 1"
+    },
+    {
+        "question": "What is the total gas consumption for LAM segment customers?",
+        "hint": "LAM is a Segment value in customers table.",
+        "plan": """-- 1. Source Tables: customers (Segment), yearmonth (Consumption) - JOIN on CustomerID
+-- 2. Filter Conditions: Segment = 'LAM'
+-- 3. Aggregation: SUM(Consumption) across all matching rows
+-- 4. Final Projection: Total consumption (single value)""",
+        "sql": "SELECT SUM(T2.Consumption) FROM customers AS T1 INNER JOIN yearmonth AS T2 ON T1.CustomerID = T2.CustomerID WHERE T1.Segment = 'LAM'"
+    },
+]
+
+
+def format_dataflow_prompt(
+    question: str,
+    schema: str,
+    tokenizer=None,
+    hint: str = None,
+) -> str:
+    """
+    Create a Data Flow prompt that forces execution-order planning.
+
+    The key insight: SQL syntax (SELECT-first) conflicts with logical order
+    (FROM-first). By forcing the model to plan in execution order, we align
+    autoregressive generation with the dependency graph.
+
+    Output format:
+    -- 1. Source Tables: [FROM/JOIN - which tables?]
+    -- 2. Filter Conditions: [WHERE - what rows to keep?]
+    -- 3. Aggregation: [GROUP BY/ORDER BY - how to process?]
+    -- 4. Final Projection: [SELECT - what columns to return?]
+    SELECT ...
+
+    Args:
+        question: Natural language question
+        schema: Database schema with sample data (augmented schema)
+        tokenizer: Tokenizer for chat template
+        hint: Optional hint/evidence
+
+    Returns:
+        Formatted prompt string
+    """
+    messages = []
+
+    # System message enforcing Data Flow structure
+    system_content = """You are a SQL expert. Plan queries in EXECUTION ORDER before writing SQL.
+
+OUTPUT FORMAT (all 4 steps required as SQL comments, then the query):
+-- 1. Source Tables: [Which tables contain the data? How do they JOIN?]
+-- 2. Filter Conditions: [What rows to keep? WHERE clause conditions]
+-- 3. Aggregation: [GROUP BY? ORDER BY? LIMIT? SUM/COUNT/MAX?]
+-- 4. Final Projection: [What columns to SELECT? Just what's asked, no extras]
+SELECT ...
+
+CRITICAL RULES:
+- Dates are YYYYMMDD strings: SUBSTR(Date, 1, 4) for year, SUBSTR(Date, 5, 2) for month
+- "Which X has most Y" = GROUP BY X, ORDER BY SUM(Y) DESC, LIMIT 1
+- Return ONLY requested columns, never add extra "helpful" columns
+- Think about JOINs FIRST, then filters, then what to return"""
+
+    messages.append({"role": "system", "content": system_content})
+
+    # Add Data Flow few-shot examples
+    for ex in DATAFLOW_FEW_SHOT_EXAMPLES:
+        user_msg = f"Question: {ex['question']}"
+        if ex.get('hint'):
+            user_msg += f"\nHint: {ex['hint']}"
+        messages.append({"role": "user", "content": user_msg})
+
+        # Assistant shows plan then SQL
+        assistant_msg = f"""{ex['plan']}
+{ex['sql']}"""
+        messages.append({"role": "assistant", "content": assistant_msg})
+
+    # Final user question with augmented schema
+    final_user = f"""Database schema and sample data:
+
+{schema}
+
+Question: {question}"""
+
+    if hint:
+        final_user += f"\nHint: {hint}"
+
+    messages.append({"role": "user", "content": final_user})
+
+    # Apply chat template
+    if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        return prompt
+
+    return messages
+
+
+def extract_sql_from_dataflow(response: str) -> str:
+    """
+    Extract SQL from a Data Flow response.
+
+    The response contains SQL comments (-- 1. Source...) followed by the query.
+    SQLite ignores comments, so we can keep them, but we extract clean SQL
+    for consistency.
+
+    Args:
+        response: Full model response with plan and SQL
+
+    Returns:
+        Extracted SQL query (may include comments, which SQLite ignores)
+    """
+    import re
+
+    # The response should have comment lines followed by SELECT
+    # We keep the whole thing since SQLite ignores comments
+    lines = response.strip().split('\n')
+
+    # Find the SELECT statement
+    sql_started = False
+    sql_lines = []
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # Skip empty lines before SQL
+        if not line_stripped and not sql_started:
+            continue
+
+        # Check if this is the start of SQL
+        if line_stripped.upper().startswith('SELECT'):
+            sql_started = True
+
+        if sql_started:
+            # Stop if we hit a new planning section or explanation
+            if line_stripped.startswith('--') and any(
+                marker in line_stripped.lower()
+                for marker in ['source', 'filter', 'aggregation', 'projection', 'explanation', 'note:']
+            ):
+                break
+            sql_lines.append(line_stripped)
+
+    if sql_lines:
+        sql = ' '.join(sql_lines)
+        # Clean up
+        sql = sql.rstrip(';').strip()
+        return sql
+
+    # Fallback: look for SELECT anywhere
+    select_match = re.search(r'(SELECT\s+.+?)(?:;|\Z)', response, re.IGNORECASE | re.DOTALL)
+    if select_match:
+        return select_match.group(1).strip()
+
+    # Last resort
+    return response.strip()

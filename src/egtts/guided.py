@@ -10,7 +10,14 @@ from sqlglot import exp
 from .database import ExplainSuccess, explain_query
 from .model import create_sql_prompt, generate_sql
 from .schema import SchemaIndex, build_schema_index, get_augmented_schema
-from .prompts import format_few_shot_prompt, detect_singular_intent, format_cot_prompt, extract_sql_from_cot
+from .prompts import (
+    format_few_shot_prompt,
+    detect_singular_intent,
+    format_cot_prompt,
+    extract_sql_from_cot,
+    format_dataflow_prompt,
+    extract_sql_from_dataflow,
+)
 
 
 @dataclass
@@ -1816,4 +1823,145 @@ Return only the optimized SQL query, without explanation."""
             latency_ms=total_time,
             generation_times_ms=all_generation_times,
             explain_times_ms=all_explain_times,
+        )
+
+    def generate_with_dataflow(
+        self, question: str, db_path: str, hint: str = None, num_samples: int = 16
+    ) -> GenerationResult:
+        """
+        Generate SQL with Data Flow Chain-of-Thought (M14).
+
+        This strategy forces the model to plan in EXECUTION ORDER:
+        1. Source Tables (FROM/JOIN) - establish the data scope first
+        2. Filter Conditions (WHERE) - narrow down rows
+        3. Aggregation (GROUP BY/ORDER BY) - how to process
+        4. Final Projection (SELECT) - what to return
+
+        Key insight: SQL's syntax order (SELECT-first) conflicts with logical
+        dependency order (FROM-first). By aligning generation with execution
+        order, we reduce hallucinations caused by predicting columns before
+        establishing table scope.
+
+        Uses M10's augmented schema + M7's plan-based voting on top.
+
+        Args:
+            question: Natural language question
+            db_path: Path to SQLite database
+            hint: Optional hint/evidence from BIRD
+            num_samples: Number of diverse samples (default: 16)
+
+        Returns:
+            GenerationResult with dataflow-guided SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Get augmented schema with sample rows (from M10)
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+
+        # Create Data Flow prompt with augmented schema
+        prompt = format_dataflow_prompt(question, augmented_schema, self.tokenizer, hint)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates with temperature sampling
+        # Use max_new_tokens=384 to accommodate the 4-step plan + SQL
+        gen_start = time.perf_counter()
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=384,  # Plan (~100 tokens) + SQL (~150 tokens)
+                    num_return_sequences=num_samples,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.95,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+        except torch.cuda.OutOfMemoryError:
+            # OOM - fall back to smaller batch
+            torch.cuda.empty_cache()
+            outputs_list = []
+            batch_size = num_samples // 2
+
+            for _ in range(2):
+                with torch.no_grad():
+                    batch_outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=384,
+                        num_return_sequences=batch_size,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+                outputs_list.append(batch_outputs)
+                torch.cuda.empty_cache()
+
+            outputs = torch.cat(outputs_list, dim=0)
+
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Decode and extract SQL from each response
+        candidates = []
+        plan_samples = []  # Store some plans for debugging
+
+        for i, output in enumerate(outputs):
+            generated_ids = output[input_length:]
+            full_response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+            # Extract SQL from Data Flow response
+            sql = extract_sql_from_dataflow(full_response)
+            candidates.append(sql)
+
+            # Store first few plans for debugging
+            if i < 3:
+                plan_samples.append(full_response[:400])
+
+        # Validate and get plan signatures (using M7's voting)
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Perform plan-based majority voting
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Add M14-specific metadata
+        vote_stats["strategy"] = "M14_DataFlow"
+        vote_stats["schema_augmentation_time_ms"] = schema_time
+        vote_stats["num_samples"] = num_samples
+        vote_stats["plan_samples"] = plan_samples
+
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, schema_time],
+            explain_times_ms=explain_times,
         )

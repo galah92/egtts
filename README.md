@@ -24,6 +24,7 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 | **M10** | **62.0%** | 0.596 | **Schema augmentation + plan voting** |
 | M11 | 30.0% | 0.702 | Chain-of-thought (failed - batch errors) |
 | M12 | 58.0% | 0.557 | Execution-based self-correction |
+| M14 | 34.0% | 0.505 | Data Flow CoT (failed - batch errors) |
 
 ### Full Benchmark (500 examples)
 
@@ -84,6 +85,14 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 - **Result:** 58% accuracy - slightly worse than M10 (62%)
 - Most failures return data (just wrong data), so execution check doesn't help
 
+### M14: Data Flow Chain-of-Thought (Failed Experiment)
+- Structured 4-step execution-order planning (FROM → WHERE → GROUP BY → SELECT)
+- Hypothesis: SQL's SELECT-first syntax conflicts with logical dependencies
+- Used 2 few-shot examples + schema augmentation + plan voting (16 samples)
+- **Result:** 34% accuracy (17 correct, 15 incorrect, 18 failed)
+- Same tensor size mismatch errors as M11 (36% failure rate)
+- Hypothesis disproven: Execution-order planning doesn't help 7B models
+
 ---
 
 ## Quick Start
@@ -131,6 +140,9 @@ uv run python scripts/run_bird_ves.py \
 
 # M12 (execution-based self-correction)
 --strategy M12
+
+# M14 (data flow chain-of-thought)
+--strategy M14
 ```
 
 ---
@@ -202,9 +214,9 @@ egtts/
 ├── src/egtts/
 │   ├── model.py         # Model loading, SQL generation
 │   ├── database.py      # EXPLAIN QUERY PLAN analysis
-│   ├── guided.py        # All strategies (M4-M12)
+│   ├── guided.py        # All strategies (M4-M14)
 │   ├── plans.py         # Plan normalization and voting
-│   ├── prompts.py       # Few-shot prompting and CoT (M9, M11)
+│   ├── prompts.py       # Few-shot prompting and CoT (M9, M11, M14)
 │   └── schema.py        # Schema utilities and augmentation (M10)
 │
 ├── scripts/
@@ -236,8 +248,9 @@ egtts/
 1. **Few-shot prompting (M9)**: Domain-specific examples hurt generalization (-8%)
 2. **Simulation filter**: Column count validation was too aggressive
 3. **Token-level steering**: SQL's declarative structure incompatible with real-time intervention
-4. **Chain-of-thought (M11)**: Variable-length reasoning broke batch generation, 30% accuracy
+4. **Chain-of-thought (M11, M14)**: Variable-length reasoning broke batch generation, 30-34% accuracy
 5. **Execution correction (M12)**: Most wrong queries return data, so empty-result check doesn't help
+6. **Execution-order planning (M14)**: Forcing FROM-first logic didn't improve over standard SQL syntax
 
 ### Scientific Conclusion
 
