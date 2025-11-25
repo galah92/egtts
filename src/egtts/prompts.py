@@ -499,3 +499,229 @@ def extract_sql_from_dataflow(response: str) -> str:
 
     # Last resort
     return response.strip()
+
+
+# =============================================================================
+# M16: Selective Reasoning - Question Classification
+# =============================================================================
+
+# Patterns that indicate reasoning is likely to help (based on M10 vs M11 analysis)
+REASONING_BENEFICIAL_PATTERNS = {
+    # "Highest/lowest/most/least" questions - 42% accuracy without reasoning
+    # These need GROUP BY + aggregate + ORDER BY logic
+    'superlative': [
+        'highest', 'lowest', 'most', 'least', 'peak', 'maximum', 'minimum',
+        'top', 'bottom', 'largest', 'smallest', 'greatest', 'best', 'worst',
+        'fewest', 'biggest',
+    ],
+    # Multi-step comparisons often confused
+    'comparison': [
+        'more than', 'less than', 'greater than', 'fewer than',
+        'compared to', 'versus', 'vs',
+    ],
+    # Rate/change calculations need careful thought
+    'rate_change': [
+        'rate', 'growth', 'decline', 'decrease', 'increase',
+        'change from', 'change between',
+    ],
+}
+
+# Patterns where direct generation works well (63%+ accuracy)
+# Reasoning may introduce errors through overthinking
+DIRECT_GENERATION_PATTERNS = {
+    'simple_count': ['how many', 'count of', 'number of', 'total number'],
+    'simple_list': ['list all', 'show all', 'what are the', 'give me'],
+    'simple_lookup': ['what is the name', 'who is', 'which is'],
+}
+
+
+def classify_question_for_reasoning(question: str, hint: str = None) -> dict:
+    """
+    Classify whether a question would benefit from Chain-of-Thought reasoning.
+
+    Based on empirical analysis:
+    - Superlative questions (highest/lowest/most/least): 42% accuracy without CoT
+    - Simple queries: 63% accuracy - reasoning can hurt here
+    - Multi-table joins: Lower accuracy, reasoning helps with JOIN planning
+
+    Args:
+        question: Natural language question
+        hint: Optional hint/evidence (may indicate complexity)
+
+    Returns:
+        dict with:
+            - needs_reasoning: bool
+            - reason: str explaining the classification
+            - patterns_matched: list of matched pattern categories
+            - confidence: float (0-1) indicating classification confidence
+    """
+    q_lower = question.lower()
+    hint_lower = (hint or '').lower()
+
+    patterns_matched = []
+    reasoning_score = 0  # Positive = needs reasoning, negative = direct generation
+
+    # Check for reasoning-beneficial patterns
+    for category, keywords in REASONING_BENEFICIAL_PATTERNS.items():
+        for kw in keywords:
+            if kw in q_lower:
+                patterns_matched.append(f"{category}:{kw}")
+                reasoning_score += 2  # Strong signal for reasoning
+
+    # Check for direct-generation patterns
+    for category, keywords in DIRECT_GENERATION_PATTERNS.items():
+        for kw in keywords:
+            if kw in q_lower:
+                patterns_matched.append(f"direct:{kw}")
+                reasoning_score -= 1  # Weak signal against reasoning
+
+    # Additional heuristics
+    # 1. Questions with "for each" likely need GROUP BY reasoning
+    if 'for each' in q_lower or 'per ' in q_lower:
+        reasoning_score += 1
+        patterns_matched.append("grouping:for_each")
+
+    # 2. Complex hints suggest complex queries
+    if hint_lower:
+        # Long hints often indicate tricky queries
+        if len(hint_lower) > 100:
+            reasoning_score += 1
+            patterns_matched.append("hint:complex")
+        # Hints mentioning calculations
+        if any(calc in hint_lower for calc in ['calculate', 'formula', 'ratio', 'percentage']):
+            reasoning_score += 1
+            patterns_matched.append("hint:calculation")
+
+    # 3. Multiple question marks or "and" conjunctions suggest multi-part
+    if question.count('?') > 1 or ' and ' in q_lower:
+        reasoning_score += 1
+        patterns_matched.append("structure:multi_part")
+
+    # Decision threshold
+    needs_reasoning = reasoning_score >= 2
+
+    # Calculate confidence
+    if reasoning_score >= 3:
+        confidence = 0.9
+        reason = "Strong reasoning signals: superlative/comparison pattern"
+    elif reasoning_score >= 2:
+        confidence = 0.7
+        reason = "Moderate reasoning signals: likely needs careful planning"
+    elif reasoning_score <= -1:
+        confidence = 0.8
+        reason = "Direct generation preferred: simple query pattern"
+    else:
+        confidence = 0.5
+        reason = "Ambiguous: defaulting to direct generation"
+        needs_reasoning = False
+
+    return {
+        'needs_reasoning': needs_reasoning,
+        'reason': reason,
+        'patterns_matched': patterns_matched,
+        'confidence': confidence,
+        'reasoning_score': reasoning_score,
+    }
+
+
+# Focused CoT prompt for selective reasoning - shorter and more structured
+SELECTIVE_COT_TEMPLATE = """You are a SQL expert. This query requires careful reasoning.
+
+THINK STEP BY STEP:
+1. Tables needed and JOIN conditions
+2. WHERE filters
+3. Aggregation: GROUP BY? ORDER BY? LIMIT?
+4. SELECT: Return ONLY what's asked
+
+CRITICAL for "{pattern_type}" questions:
+{pattern_specific_guidance}
+
+**OUTPUT RULE**: Return EXACTLY the columns asked for. NO extra columns like "TotalConsumption" or "Count" - just the answer.
+
+Schema:
+{schema}
+
+Question: {question}
+{hint_section}
+
+Think step by step, then write SQL:
+"""
+
+PATTERN_GUIDANCE = {
+    'superlative': """- "highest/most X" = GROUP BY entity, ORDER BY SUM(X) DESC, LIMIT 1
+- "lowest/least X" = GROUP BY entity, ORDER BY SUM(X) ASC, LIMIT 1
+- Do NOT use MAX/MIN on aggregated values - use ORDER BY + LIMIT instead
+- Return ONLY the entity (e.g., CustomerID, Year), NOT the aggregated value""",
+
+    'comparison': """- Identify BOTH sides of the comparison clearly
+- Use CASE WHEN or separate subqueries for each side
+- Double-check the order of subtraction (A - B vs B - A)""",
+
+    'rate_change': """- Rate = (new - old) / old
+- Ensure you're comparing the same entity across time periods
+- Watch for division by zero""",
+
+    'default': """- Identify all required tables and their relationships
+- Consider whether GROUP BY is needed for aggregation
+- Verify column names exist in the schema""",
+}
+
+
+def format_selective_cot_prompt(
+    question: str,
+    schema: str,
+    classification: dict,
+    tokenizer=None,
+    hint: str = None,
+) -> str:
+    """
+    Create a focused CoT prompt based on the question classification.
+
+    Unlike the generic CoT prompt, this provides pattern-specific guidance
+    to help the model avoid common errors for that question type.
+
+    Args:
+        question: Natural language question
+        schema: Augmented schema with sample data
+        classification: Result from classify_question_for_reasoning()
+        tokenizer: Tokenizer for chat template
+        hint: Optional hint/evidence
+
+    Returns:
+        Formatted prompt string
+    """
+    # Determine primary pattern type
+    patterns = classification.get('patterns_matched', [])
+    pattern_type = 'default'
+    for p in patterns:
+        if p.startswith('superlative:'):
+            pattern_type = 'superlative'
+            break
+        elif p.startswith('comparison:'):
+            pattern_type = 'comparison'
+            break
+        elif p.startswith('rate_change:'):
+            pattern_type = 'rate_change'
+            break
+
+    guidance = PATTERN_GUIDANCE.get(pattern_type, PATTERN_GUIDANCE['default'])
+    hint_section = f"Hint: {hint}" if hint else ""
+
+    prompt_text = SELECTIVE_COT_TEMPLATE.format(
+        pattern_type=pattern_type,
+        pattern_specific_guidance=guidance,
+        schema=schema,
+        question=question,
+        hint_section=hint_section,
+    )
+
+    messages = [{"role": "user", "content": prompt_text}]
+
+    if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+    return prompt_text

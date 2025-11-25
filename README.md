@@ -106,6 +106,72 @@ A research project exploring inference-time scaling for Text-to-SQL. We achieve 
 
 ---
 
+## Experimental Strategies (M19-M25)
+
+These strategies explore execution-guided generation inspired by the [EG-CFG paper](https://arxiv.org/abs/2506.10948) and BIRD benchmark papers like TA-SQL.
+
+### M19: Example-Guided (DAIL-SQL inspired) - Best Experimental
+- Select similar examples from the same database using question similarity
+- Provide 3-5 few-shot examples with schema context
+- **Result:** 60% accuracy on 10 examples - **Best experimental strategy**
+- **Why it works:** Examples implicitly teach correct table/column names
+
+### M20: Token-Level CFG Constrained Decoding - Failed Experiment
+- Apply CFG-style guidance at token level during generation
+- Validate partial SQL with EXPLAIN during decoding
+- **Result:** 33% accuracy - incomplete SQL generation issues
+- Token-by-token validation too granular for SQL structure
+
+### M21: Schema-Aware Reranking
+- Generate multiple candidates with temperature sampling
+- Rerank by schema validity (correct table/column references)
+- **Result:** 40% accuracy on 10 examples
+- Schema validation alone insufficient
+
+### M22: Execution-Guided Validation
+- Generate candidates and validate with EXPLAIN
+- Use partial SQL completion for validation during generation
+- **Result:** 50% accuracy on 10 examples
+- Binary pass/fail feedback not informative enough
+
+### M23: Example-Guided + Execution-Validated (Combined)
+- Combine M19's example selection with M22's validation
+- **Result:** 50% accuracy on 10 examples - same as M22
+- Validation didn't improve over example-guided alone
+
+### M24: Task-Aligned SQL (TA-SQL inspired) - Failed Experiment
+- Generate "dummy SQL" first for schema linking (TASL)
+- Frame SQL as step-by-step data analysis (TALOG)
+- **Result:** 40% accuracy on 5 examples
+- **Why it failed:** Intermediate "dummy SQL" step caused hallucinations (e.g., hallucinated non-existent tables). TA-SQL designed for GPT-4, not 7B models.
+
+### M25: EG-CFG Execution-Guided Generation - Experimental
+- Based on [EG-CFG paper](https://arxiv.org/abs/2506.10948) methodology
+- Generate multiple candidates with execution scoring
+- Score by: syntax validity, table validity, column validity, execution success
+- **Status:** Experimental - slow due to multiple candidate generation
+
+### Why Execution Guidance Works Differently for SQL vs Code
+
+The EG-CFG paper achieved excellent results for code generation (83.2% on MBPP with 1.3B model). However, execution guidance doesn't transfer directly to SQL for several reasons:
+
+| Aspect | Code (EG-CFG) | SQL (Our attempts) |
+|--------|---------------|---------------------|
+| **Test cases** | Input/output pairs available | No test cases, only DB schema |
+| **Execution trace** | Rich: variables, line numbers, values | Poor: pass/fail from EXPLAIN |
+| **Partial execution** | Meaningful (partial programs run) | Limited (partial SQL rarely informative) |
+| **Error localization** | Line-level errors guide fixes | Schema errors = immediate rejection |
+| **Semantic feedback** | Can check output matches expected | No expected output to compare |
+
+**Key insight:** EG-CFG relies on test cases to provide semantic feedback during generation. Without expected results, we can only validate syntax - which isn't the bottleneck for modern LLMs.
+
+**Best approach for SQL:** Example-guided (M19) at 60% accuracy, because:
+1. Schema knowledge embedded in examples
+2. No intermediate steps that can hallucinate
+3. Pattern transfer from similar questions
+
+---
+
 ## Quick Start
 
 ### Installation
@@ -265,6 +331,7 @@ egtts/
 4. **Chain-of-thought (M11, M14)**: Variable-length reasoning broke batch generation, 30-34% accuracy
 5. **Execution correction (M12)**: Most wrong queries return data, so empty-result check doesn't help
 6. **Execution-order planning (M14)**: Forcing FROM-first logic didn't improve over standard SQL syntax
+7. **EG-CFG for SQL (M20-M25)**: Execution guidance works for code (has test cases) but not SQL (no expected results)
 
 ### Scientific Conclusion
 
@@ -336,6 +403,9 @@ We tested whether larger models improve accuracy with quantization to fit in GPU
 - [BIRD Benchmark](https://bird-bench.github.io/) - Li et al., NeurIPS 2023
 - [Qwen2.5-Coder](https://github.com/QwenLM/Qwen2.5-Coder) - Alibaba Cloud
 - [Self-Consistency](https://arxiv.org/abs/2203.11171) - Wang et al., 2022 (inspiration for voting)
+- [EG-CFG: Execution Guided Line-by-Line Code Generation](https://arxiv.org/abs/2506.10948) - Lavon et al., 2024
+- [DAIL-SQL](https://arxiv.org/abs/2308.15363) - Gao et al., 2023 (inspiration for M19)
+- [TA-SQL: Task Alignment for Text-to-SQL](https://arxiv.org/abs/2402.12960) - ACL Findings 2024 (inspiration for M24)
 
 ---
 

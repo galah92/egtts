@@ -580,6 +580,575 @@ def run_dataflow(
     return result.sql, metadata
 
 
+def run_hybrid_reasoning(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_cot_samples: int = 5,
+    num_direct_samples: int = 10,
+) -> tuple[str, dict]:
+    """Run M17 strategy (Hybrid Reasoning - CoT + direct, vote across both)."""
+    start_time = time.perf_counter()
+
+    # Generate using hybrid reasoning strategy
+    result = generator.generate_with_hybrid_reasoning(
+        question,
+        str(db_path),
+        hint=evidence,
+        num_cot_samples=num_cot_samples,
+        num_direct_samples=num_direct_samples,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    total_samples = num_cot_samples + num_direct_samples
+    valid_candidates = vote_stats.get("valid_candidates", total_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    # Extract classification metadata
+    classification = vote_stats.get("classification", {})
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M17",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "cot_samples": vote_stats.get("cot_samples", 0),
+        "direct_samples": vote_stats.get("direct_samples", 0),
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "used_reasoning": vote_stats.get("used_reasoning", False),
+        "classification_reason": classification.get("reason", ""),
+        "classification_patterns": classification.get("patterns", []),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
+# Global M18 generator (initialized lazily to share model with other strategies)
+_m18_generator = None
+
+
+def get_m18_generator(model, tokenizer):
+    """Get or create M18 generator."""
+    global _m18_generator
+    if _m18_generator is None:
+        from egtts.validated_decomp import ValidatedDecompositionGenerator
+        _m18_generator = ValidatedDecompositionGenerator(model, tokenizer)
+    return _m18_generator
+
+
+def run_validated_decomposition(
+    question: str,
+    evidence: str,
+    db_path: Path,
+    samples_per_phase: int = 8,
+) -> tuple[str, dict]:
+    """Run M18 strategy (Validated Decomposition with PAC-style error control)."""
+    # M18 uses its own generator - need to access global model
+    # This function will be called from main loop which has generator available
+    # We'll need to pass model/tokenizer or make generator global
+
+    # For now, create a lightweight wrapper that gets model from globals
+    global _m18_generator
+
+    if _m18_generator is None:
+        raise RuntimeError("M18 generator not initialized. Call init_m18_generator first.")
+
+    start_time = time.perf_counter()
+
+    result = _m18_generator.generate(
+        question=question,
+        db_path=str(db_path),
+        hint=evidence,
+        samples_per_phase=samples_per_phase,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Extract phase information
+    phase_info = {}
+    for phase_name, phase_result in result.phases.items():
+        phase_info[phase_name] = {
+            "output": phase_result.output[:100] if phase_result.output else "",
+            "votes": phase_result.votes,
+            "valid": phase_result.valid,
+            "attempts": phase_result.validation_attempts,
+        }
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M18",
+        "valid": result.valid,
+        "phases": phase_info,
+        "validation_stats": result.validation_stats,
+        "latency_ms": result.total_latency_ms,
+    }
+
+    return result.sql, metadata
+
+
+def run_example_guided(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 15,
+) -> tuple[str, dict]:
+    """Run M19 strategy (Example-Guided Few-Shot Learning)."""
+    start_time = time.perf_counter()
+
+    # Generate using example-guided strategy
+    result = generator.generate_with_example_guidance(
+        question,
+        str(db_path),
+        hint=evidence,
+        num_samples=num_samples,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M19",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "detected_patterns": vote_stats.get("detected_patterns", []),
+        "selected_examples": vote_stats.get("selected_examples", []),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
+# Global CFG generator (initialized lazily)
+_cfg_generator = None
+
+
+def get_cfg_generator(model, tokenizer):
+    """Get or create CFG generator."""
+    global _cfg_generator
+    if _cfg_generator is None:
+        from egtts.cfg_sql import CFGSQLGeneratorWithBeams
+        _cfg_generator = CFGSQLGeneratorWithBeams(
+            model, tokenizer,
+            cfg_alpha=1.5,
+            temperature=0.7,
+        )
+    return _cfg_generator
+
+
+def run_cfg_sql(
+    question: str,
+    evidence: str,
+    db_path: Path,
+    model,
+    tokenizer,
+    num_samples: int = 15,
+    cfg_alpha: float = 1.5,
+) -> tuple[str, dict]:
+    """Run M20 strategy (Token-Level CFG with Schema Guidance)."""
+    from egtts.cfg_sql import SchemaInfo, CFGSQLGeneratorWithBeams
+    from egtts.schema import get_augmented_schema
+    from egtts.model import create_sql_prompt
+
+    start_time = time.perf_counter()
+
+    # Build schema info for validation
+    schema = SchemaInfo.from_database(str(db_path))
+
+    # Get augmented schema for prompt
+    augmented_schema = get_augmented_schema(str(db_path), max_rows_per_table=3)
+
+    # Create prompt
+    full_question = f"{question}\nHint: {evidence}" if evidence else question
+    prompt = create_sql_prompt(full_question, augmented_schema, tokenizer)
+
+    # Get or create generator
+    generator = get_cfg_generator(model, tokenizer)
+    generator.cfg_alpha = cfg_alpha
+
+    # Generate with CFG
+    sql, vote_stats = generator.generate_with_voting(
+        prompt, schema, str(db_path), num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M20_CFG",
+        "valid": vote_stats.get("valid_candidates", 0) > 0,
+        "votes": vote_stats.get("winning_votes", 0),
+        "num_samples": num_samples,
+        "valid_candidates": vote_stats.get("valid_candidates", 0),
+        "cfg_alpha": cfg_alpha,
+    }
+
+    return sql, metadata
+
+
+# Global cache for schema reranker
+_schema_reranker = None
+
+
+def get_schema_reranker(model, tokenizer):
+    """Get or create the SchemaAwareReranker."""
+    global _schema_reranker
+    if _schema_reranker is None:
+        from egtts.cfg_sql import SchemaAwareReranker
+        _schema_reranker = SchemaAwareReranker(
+            model, tokenizer,
+            temperature=0.7,
+        )
+    return _schema_reranker
+
+
+def run_schema_rerank(
+    question: str,
+    evidence: str,
+    db_path: Path,
+    model,
+    tokenizer,
+    num_samples: int = 15,
+) -> tuple[str, dict]:
+    """Run M21 strategy (Schema-Aware Reranking with fast batch generation)."""
+    from egtts.cfg_sql import SchemaInfo, SchemaAwareReranker
+    from egtts.schema import get_augmented_schema
+    from egtts.model import create_sql_prompt
+
+    start_time = time.perf_counter()
+
+    # Build schema info for validation
+    schema = SchemaInfo.from_database(str(db_path))
+
+    # Get augmented schema for prompt
+    augmented_schema = get_augmented_schema(str(db_path), max_rows_per_table=3)
+
+    # Create prompt
+    full_question = f"{question}\nHint: {evidence}" if evidence else question
+    prompt = create_sql_prompt(full_question, augmented_schema, tokenizer)
+
+    # Get or create reranker
+    reranker = get_schema_reranker(model, tokenizer)
+
+    # Generate with schema-aware reranking
+    sql, vote_stats = reranker.generate_with_reranking(
+        prompt, schema, str(db_path), num_samples
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M21_SchemaRerank",
+        "valid": vote_stats.get("valid_candidates", 0) > 0,
+        "num_samples": num_samples,
+        **vote_stats,
+    }
+
+    return sql, metadata
+
+
+# Global cache for execution-guided generator
+_exec_guided_generator = None
+
+
+def get_exec_guided_generator(model, tokenizer):
+    """Get or create the ExecutionGuidedGenerator."""
+    global _exec_guided_generator
+    if _exec_guided_generator is None:
+        from egtts.cfg_sql import ExecutionGuidedGenerator
+        _exec_guided_generator = ExecutionGuidedGenerator(
+            model, tokenizer,
+            temperature=0.7,
+            chunk_size=15,  # Validate every 15 tokens
+        )
+    return _exec_guided_generator
+
+
+def run_execution_guided(
+    question: str,
+    evidence: str,
+    db_path: Path,
+    model,
+    tokenizer,
+    num_attempts: int = 5,
+) -> tuple[str, dict]:
+    """Run M22 strategy (Execution-Guided Generation with Partial SQL Validation)."""
+    from egtts.cfg_sql import ExecutionGuidedGenerator
+    from egtts.schema import get_augmented_schema
+    from egtts.model import create_sql_prompt
+
+    start_time = time.perf_counter()
+
+    # Get augmented schema for prompt
+    augmented_schema = get_augmented_schema(str(db_path), max_rows_per_table=3)
+
+    # Create prompt
+    full_question = f"{question}\nHint: {evidence}" if evidence else question
+    prompt = create_sql_prompt(full_question, augmented_schema, tokenizer)
+
+    # Get or create generator
+    generator = get_exec_guided_generator(model, tokenizer)
+
+    # Generate with execution-guided validation
+    sql, gen_stats = generator.generate_with_validation(
+        prompt, str(db_path), num_attempts
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M22_ExecGuided",
+        "num_attempts": num_attempts,
+        **gen_stats,
+    }
+
+    return sql, metadata
+
+
+# Global cache for example-guided-validated generator
+_example_guided_validated_generator = None
+
+
+def get_example_guided_validated_generator(model, tokenizer):
+    """Get or create the ExampleGuidedWithValidation generator."""
+    global _example_guided_validated_generator
+    if _example_guided_validated_generator is None:
+        from egtts.cfg_sql import ExampleGuidedWithValidation
+        _example_guided_validated_generator = ExampleGuidedWithValidation(
+            model, tokenizer,
+            temperature=0.7,
+        )
+    return _example_guided_validated_generator
+
+
+def run_example_guided_validated(
+    question: str,
+    evidence: str,
+    schema: str,
+    db_path: Path,
+    model,
+    tokenizer,
+) -> tuple[str, dict]:
+    """Run M23 strategy (Example-Guided + Execution-Validated)."""
+    start_time = time.perf_counter()
+
+    # Get or create generator
+    generator = get_example_guided_validated_generator(model, tokenizer)
+
+    # Generate with examples and validation
+    sql, gen_stats = generator.generate_with_examples_and_validation(
+        question, schema, evidence, str(db_path),
+        num_attempts=3,
+        num_samples_per_attempt=5,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M23_ExampleGuidedValidated",
+        **gen_stats,
+    }
+
+    return sql, metadata
+
+
+# Global cache for task-aligned generator
+_task_aligned_generator = None
+
+
+def get_task_aligned_generator(model, tokenizer):
+    """Get or create the TaskAlignedWithValidation generator."""
+    global _task_aligned_generator
+    if _task_aligned_generator is None:
+        from egtts.task_aligned import TaskAlignedWithValidation
+        _task_aligned_generator = TaskAlignedWithValidation(
+            model, tokenizer,
+            temperature=0.3,
+        )
+    return _task_aligned_generator
+
+
+def run_task_aligned(
+    question: str,
+    evidence: str,
+    schema: str,
+    db_path: Path,
+    model,
+    tokenizer,
+) -> tuple[str, dict]:
+    """Run M24 strategy (Task-Aligned SQL Generation - TA-SQL inspired)."""
+    start_time = time.perf_counter()
+
+    # Get or create generator
+    generator = get_task_aligned_generator(model, tokenizer)
+
+    # Generate with task alignment and validation
+    sql, gen_stats = generator.generate_with_validation(
+        question, schema, evidence, str(db_path),
+        num_candidates=3,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M24_TaskAligned",
+        **gen_stats,
+    }
+
+    return sql, metadata
+
+
+# Global EG-CFG generator cache
+_eg_cfg_generator = None
+
+
+def get_eg_cfg_generator(model, tokenizer, db_path: str):
+    """Get or create cached EG-CFG generator."""
+    global _eg_cfg_generator
+    if _eg_cfg_generator is None:
+        from egtts.eg_cfg import EGCFGFast
+        _eg_cfg_generator = EGCFGFast(
+            model=model,
+            tokenizer=tokenizer,
+            db_path=db_path,
+            num_candidates=5,
+            temperature=0.7,
+        )
+    else:
+        # Update db_path for each query
+        _eg_cfg_generator.db_path = db_path
+        _eg_cfg_generator.schema_info = _eg_cfg_generator._get_schema_info()
+    return _eg_cfg_generator
+
+
+def run_eg_cfg(
+    question: str,
+    evidence: str,
+    schema: str,
+    db_path: Path,
+    model,
+    tokenizer,
+) -> tuple[str, dict]:
+    """Run M25 strategy (EG-CFG - Execution-Guided Classifier-Free Guidance)."""
+    start_time = time.perf_counter()
+
+    # Get or create generator
+    generator = get_eg_cfg_generator(model, tokenizer, str(db_path))
+
+    # Generate with EG-CFG
+    sql, gen_stats = generator.generate(question, schema, evidence)
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M25_EGCFG",
+        **gen_stats,
+    }
+
+    return sql, metadata
+
+
+def run_selective_reasoning(
+    generator: ExplainGuidedGenerator,
+    question: str,
+    schema: str,
+    evidence: str,
+    db_path: Path,
+    num_samples: int = 15,
+) -> tuple[str, dict]:
+    """Run M16 strategy (Selective Reasoning - CoT only when beneficial)."""
+    start_time = time.perf_counter()
+
+    # Generate using selective reasoning strategy
+    result = generator.generate_with_selective_reasoning(
+        question,
+        str(db_path),
+        hint=evidence,
+        num_samples=num_samples,
+    )
+
+    generation_time = (time.perf_counter() - start_time) * 1000
+
+    # Parse vote stats from error_history
+    vote_stats = {}
+    for entry in result.error_history:
+        if "Vote stats:" in str(entry):
+            import ast
+            try:
+                stats_str = str(entry).replace("Vote stats: ", "")
+                vote_stats = ast.literal_eval(stats_str)
+            except (ValueError, SyntaxError):
+                pass
+
+    # Calculate consensus confidence
+    valid_candidates = vote_stats.get("valid_candidates", num_samples)
+    winning_votes = vote_stats.get("winning_votes", 0)
+    consensus_confidence = winning_votes / valid_candidates if valid_candidates > 0 else 0
+
+    # Extract classification metadata
+    classification = vote_stats.get("classification", {})
+
+    metadata = {
+        "generation_time_ms": generation_time,
+        "strategy": "M16",
+        "valid": result.valid,
+        "votes": winning_votes,
+        "num_samples": num_samples,
+        "valid_candidates": valid_candidates,
+        "consensus_confidence": consensus_confidence,
+        "used_reasoning": vote_stats.get("used_reasoning", False),
+        "classification_reason": classification.get("reason", ""),
+        "classification_patterns": classification.get("patterns", []),
+        "classification_confidence": classification.get("confidence", 0),
+        "latency_ms": result.latency_ms,
+    }
+
+    return result.sql, metadata
+
+
 def run_execution_correction(
     generator: ExplainGuidedGenerator,
     question: str,
@@ -726,6 +1295,10 @@ def run_ves_benchmark(
     model, tokenizer = load_model(model_name=model_name, quantization=quantization)
     generator = ExplainGuidedGenerator(model, tokenizer)
 
+    # Initialize M18 generator if needed
+    if strategy == "M18":
+        get_m18_generator(model, tokenizer)
+
     results = {
         "strategy": strategy,
         "total_examples": len(examples),
@@ -832,6 +1405,46 @@ def run_ves_benchmark(
             elif strategy == "M14":
                 pred_sql, gen_metadata = run_dataflow(
                     generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M16":
+                pred_sql, gen_metadata = run_selective_reasoning(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M17":
+                pred_sql, gen_metadata = run_hybrid_reasoning(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M18":
+                pred_sql, gen_metadata = run_validated_decomposition(
+                    question, evidence, db_path
+                )
+            elif strategy == "M19":
+                pred_sql, gen_metadata = run_example_guided(
+                    generator, question, schema, evidence, db_path
+                )
+            elif strategy == "M20":
+                pred_sql, gen_metadata = run_cfg_sql(
+                    question, evidence, db_path, model, tokenizer
+                )
+            elif strategy == "M21":
+                pred_sql, gen_metadata = run_schema_rerank(
+                    question, evidence, db_path, model, tokenizer
+                )
+            elif strategy == "M22":
+                pred_sql, gen_metadata = run_execution_guided(
+                    question, evidence, db_path, model, tokenizer
+                )
+            elif strategy == "M23":
+                pred_sql, gen_metadata = run_example_guided_validated(
+                    question, evidence, schema, db_path, model, tokenizer
+                )
+            elif strategy == "M24":
+                pred_sql, gen_metadata = run_task_aligned(
+                    question, evidence, schema, db_path, model, tokenizer
+                )
+            elif strategy == "M25":
+                pred_sql, gen_metadata = run_eg_cfg(
+                    question, evidence, schema, db_path, model, tokenizer
                 )
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")

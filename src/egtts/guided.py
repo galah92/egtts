@@ -17,6 +17,8 @@ from .prompts import (
     extract_sql_from_cot,
     format_dataflow_prompt,
     extract_sql_from_dataflow,
+    classify_question_for_reasoning,
+    format_selective_cot_prompt,
 )
 
 
@@ -1951,6 +1953,539 @@ Return only the optimized SQL query, without explanation."""
         vote_stats["num_samples"] = num_samples
         vote_stats["plan_samples"] = plan_samples
 
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, schema_time],
+            explain_times_ms=explain_times,
+        )
+
+    def generate_with_selective_reasoning(
+        self, question: str, db_path: str, hint: str = None, num_samples: int = 15
+    ) -> GenerationResult:
+        """
+        Generate SQL with Selective Reasoning (M16).
+
+        This strategy applies Chain-of-Thought reasoning ONLY when it's likely
+        to help, based on question classification:
+
+        - Superlative questions (highest/lowest/most/least): Use CoT
+        - Rate/change calculations: Use CoT
+        - Simple counts/lookups: Use direct generation (M10 style)
+
+        Key insight: CoT helps with complex aggregation logic but can hurt
+        simple queries by introducing overthinking errors.
+
+        Args:
+            question: Natural language question
+            db_path: Path to SQLite database
+            hint: Optional hint/evidence from BIRD
+            num_samples: Number of diverse samples (default: 15)
+
+        Returns:
+            GenerationResult with selectively-reasoned SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Step 1: Classify the question
+        classification = classify_question_for_reasoning(question, hint)
+        needs_reasoning = classification['needs_reasoning']
+
+        # Get augmented schema with sample rows
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+
+        # Step 2: Generate candidates using appropriate strategy
+        if needs_reasoning:
+            # Use focused CoT prompt for complex questions
+            prompt = format_selective_cot_prompt(
+                question, augmented_schema, classification, self.tokenizer, hint
+            )
+            max_new_tokens = 512  # Longer for reasoning + SQL
+        else:
+            # Use direct generation for simple questions (M10 style)
+            full_question = f"{question}\nHint: {hint}" if hint else question
+            prompt = create_sql_prompt(full_question, augmented_schema, self.tokenizer)
+            max_new_tokens = 256
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate candidates one at a time to avoid tensor size mismatch
+        # (CoT responses have variable length, causing batching issues)
+        gen_start = time.perf_counter()
+        candidates = []
+
+        if needs_reasoning:
+            # Sequential generation for CoT (avoids tensor mismatch)
+            for i in range(num_samples):
+                with torch.no_grad():
+                    output = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                generated_ids = output[0][input_length:]
+                full_response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+                # Extract SQL from reasoning response
+                sql = extract_sql_from_cot(full_response)
+                candidates.append(sql)
+        else:
+            # Batch generation for direct approach (faster)
+            try:
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_return_sequences=num_samples,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                for output in outputs:
+                    generated_ids = output[input_length:]
+                    sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    # Clean up SQL
+                    sql = self._clean_sql_output(sql)
+                    candidates.append(sql)
+
+            except torch.cuda.OutOfMemoryError:
+                # Fallback to batched generation
+                torch.cuda.empty_cache()
+                outputs_list = []
+                batch_size = num_samples // 2
+
+                for _ in range(2):
+                    with torch.no_grad():
+                        batch = self.model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            num_return_sequences=batch_size,
+                            do_sample=True,
+                            temperature=0.7,
+                            top_p=0.95,
+                            pad_token_id=self.tokenizer.eos_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                        )
+                    outputs_list.append(batch)
+                    torch.cuda.empty_cache()
+
+                outputs = torch.cat(outputs_list, dim=0)
+
+                for output in outputs:
+                    generated_ids = output[input_length:]
+                    sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    sql = self._clean_sql_output(sql)
+                    candidates.append(sql)
+
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Step 3: Validate with EXPLAIN and get plan signatures
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Step 4: Plan-based majority voting
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Add M16-specific metadata
+        vote_stats["strategy"] = "M16_SelectiveReasoning"
+        vote_stats["used_reasoning"] = needs_reasoning
+        vote_stats["classification"] = {
+            "reason": classification["reason"],
+            "patterns": classification["patterns_matched"],
+            "confidence": classification["confidence"],
+            "score": classification["reasoning_score"],
+        }
+        vote_stats["schema_augmentation_time_ms"] = schema_time
+
+        error_history.append(f"Classification: {classification['reason']}")
+        error_history.append(f"Used reasoning: {needs_reasoning}")
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, schema_time],
+            explain_times_ms=explain_times,
+        )
+
+    def _clean_sql_output(self, sql: str) -> str:
+        """Clean up raw SQL output from model."""
+        # Remove markdown code blocks
+        if "```sql" in sql.lower():
+            sql = sql.split("```sql", 1)[1].split("```")[0].strip()
+        elif "```" in sql:
+            parts = sql.split("```")
+            if len(parts) >= 2:
+                sql = parts[1].strip()
+
+        # Take first SQL statement only
+        lines = []
+        for line in sql.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("--"):
+                lines.append(line)
+            elif lines:  # Stop after SQL ends
+                break
+
+        return " ".join(lines).strip().rstrip(";")
+
+    def generate_with_hybrid_reasoning(
+        self, question: str, db_path: str, hint: str = None,
+        num_cot_samples: int = 5, num_direct_samples: int = 10
+    ) -> GenerationResult:
+        """
+        Generate SQL with Hybrid Reasoning (M17).
+
+        This strategy combines CoT and direct generation for complex questions:
+        - For simple questions: 15 direct samples (fast, M10 style)
+        - For complex questions: 5 CoT samples + 10 direct samples, vote across both
+
+        Key insight: CoT catches logic errors, direct generation is faster and
+        avoids overthinking. Combining them gets best of both worlds.
+
+        Args:
+            question: Natural language question
+            db_path: Path to SQLite database
+            hint: Optional hint/evidence from BIRD
+            num_cot_samples: Number of CoT samples for complex questions (default: 5)
+            num_direct_samples: Number of direct samples (default: 10)
+
+        Returns:
+            GenerationResult with hybrid-reasoned SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+
+        start_time = time.perf_counter()
+
+        # Step 1: Classify the question
+        classification = classify_question_for_reasoning(question, hint)
+        needs_reasoning = classification['needs_reasoning']
+
+        # Get augmented schema with sample rows
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+
+        candidates = []
+        gen_start = time.perf_counter()
+
+        # Step 2a: Generate direct samples (always)
+        full_question = f"{question}\nHint: {hint}" if hint else question
+        direct_prompt = create_sql_prompt(full_question, augmented_schema, self.tokenizer)
+        direct_inputs = self.tokenizer(direct_prompt, return_tensors="pt").to(self.model.device)
+        direct_input_length = direct_inputs["input_ids"].shape[1]
+
+        # Determine how many direct samples
+        direct_count = num_direct_samples if needs_reasoning else (num_cot_samples + num_direct_samples)
+
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **direct_inputs,
+                    max_new_tokens=256,
+                    num_return_sequences=direct_count,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.95,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+
+            for output in outputs:
+                generated_ids = output[direct_input_length:]
+                sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                sql = self._clean_sql_output(sql)
+                candidates.append(("direct", sql))
+
+        except torch.cuda.OutOfMemoryError:
+            # Fallback to smaller batches
+            torch.cuda.empty_cache()
+            batch_size = direct_count // 2
+
+            for _ in range(2):
+                with torch.no_grad():
+                    batch = self.model.generate(
+                        **direct_inputs,
+                        max_new_tokens=256,
+                        num_return_sequences=batch_size,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                for output in batch:
+                    generated_ids = output[direct_input_length:]
+                    sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    sql = self._clean_sql_output(sql)
+                    candidates.append(("direct", sql))
+
+                torch.cuda.empty_cache()
+
+        # Step 2b: Generate CoT samples (only for complex questions)
+        if needs_reasoning:
+            cot_prompt = format_selective_cot_prompt(
+                question, augmented_schema, classification, self.tokenizer, hint
+            )
+            cot_inputs = self.tokenizer(cot_prompt, return_tensors="pt").to(self.model.device)
+            cot_input_length = cot_inputs["input_ids"].shape[1]
+
+            # Sequential generation for CoT (avoids tensor mismatch)
+            for i in range(num_cot_samples):
+                with torch.no_grad():
+                    output = self.model.generate(
+                        **cot_inputs,
+                        max_new_tokens=512,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                generated_ids = output[0][cot_input_length:]
+                full_response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                sql = extract_sql_from_cot(full_response)
+                candidates.append(("cot", sql))
+
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Step 3: Validate with EXPLAIN and get plan signatures
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+
+        for source, sql in candidates:
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Step 4: Plan-based majority voting across ALL candidates
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Count sources
+        cot_count = sum(1 for s, _ in candidates if s == "cot")
+        direct_count = sum(1 for s, _ in candidates if s == "direct")
+
+        # Add M17-specific metadata
+        vote_stats["strategy"] = "M17_HybridReasoning"
+        vote_stats["used_reasoning"] = needs_reasoning
+        vote_stats["cot_samples"] = cot_count
+        vote_stats["direct_samples"] = direct_count
+        vote_stats["classification"] = {
+            "reason": classification["reason"],
+            "patterns": classification["patterns_matched"],
+            "confidence": classification["confidence"],
+            "score": classification["reasoning_score"],
+        }
+        vote_stats["schema_augmentation_time_ms"] = schema_time
+
+        error_history.append(f"Classification: {classification['reason']}")
+        error_history.append(f"Used reasoning: {needs_reasoning} (CoT: {cot_count}, Direct: {direct_count})")
+        error_history.append(f"Vote stats: {vote_stats}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        valid = winning_sig != "ERROR" and vote_stats.get("valid_candidates", 0) > 0
+
+        return GenerationResult(
+            sql=winning_sql,
+            valid=valid,
+            iterations=vote_stats.get("winning_votes", 0),
+            error_history=error_history,
+            latency_ms=total_time,
+            generation_times_ms=[gen_time, schema_time],
+            explain_times_ms=explain_times,
+        )
+
+    def generate_with_example_guidance(
+        self, question: str, db_path: str, hint: str = None, num_samples: int = 15
+    ) -> GenerationResult:
+        """
+        Generate SQL with Example-Guided Few-Shot Learning (M19).
+
+        This strategy dynamically selects few-shot examples that match the
+        SQL pattern needed for the question:
+
+        - Superlative questions get examples of GROUP BY + ORDER BY + LIMIT 1
+        - Ratio/difference questions get examples of CASE WHEN aggregation
+        - Date questions get examples of SUBSTR for YYYYMMDD strings
+
+        Key insight: The model struggles with superlatives because it rarely
+        sees the correct pattern. By providing 2-3 targeted examples, we can
+        dramatically improve accuracy on hard cases.
+
+        Args:
+            question: Natural language question
+            db_path: Path to SQLite database
+            hint: Optional hint/evidence from BIRD
+            num_samples: Number of diverse samples (default: 15)
+
+        Returns:
+            GenerationResult with example-guided SQL
+        """
+        import torch
+        from .plans import normalize_plan, vote_by_plan
+        from .example_bank import format_m19_prompt, detect_question_patterns, select_examples
+
+        start_time = time.perf_counter()
+
+        # Get augmented schema with sample rows
+        schema_start = time.perf_counter()
+        augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
+        schema_time = (time.perf_counter() - schema_start) * 1000
+
+        # Detect patterns for metadata
+        detected_patterns = detect_question_patterns(question, hint or "")
+        selected_examples = select_examples(question, hint or "", n_examples=3)
+
+        # Create prompt with dynamically selected examples
+        prompt = format_m19_prompt(
+            question=question,
+            schema=augmented_schema,
+            tokenizer=self.tokenizer,
+            hint=hint or "",
+            n_examples=3,
+        )
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_length = inputs["input_ids"].shape[1]
+
+        # Generate diverse candidates
+        gen_start = time.perf_counter()
+
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    num_return_sequences=num_samples,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.95,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+
+            candidates = []
+            for output in outputs:
+                generated_ids = output[input_length:]
+                sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                sql = self._clean_sql_output(sql)
+                candidates.append(sql)
+
+        except torch.cuda.OutOfMemoryError:
+            # Fallback to smaller batches
+            torch.cuda.empty_cache()
+            candidates = []
+            batch_size = num_samples // 2
+
+            for _ in range(2):
+                with torch.no_grad():
+                    batch = self.model.generate(
+                        **inputs,
+                        max_new_tokens=256,
+                        num_return_sequences=batch_size,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.95,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                for output in batch:
+                    generated_ids = output[input_length:]
+                    sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    sql = self._clean_sql_output(sql)
+                    candidates.append(sql)
+
+                torch.cuda.empty_cache()
+
+        gen_time = (time.perf_counter() - gen_start) * 1000
+
+        # Validate with EXPLAIN and get plan signatures
+        explain_times = []
+        error_history = []
+        candidates_with_plans = []
+
+        for idx, sql in enumerate(candidates):
+            explain_start = time.perf_counter()
+            result = explain_query(sql, db_path)
+            explain_time = (time.perf_counter() - explain_start) * 1000
+            explain_times.append(explain_time)
+
+            if isinstance(result, ExplainSuccess):
+                signature = normalize_plan(result.plan)
+                cost = self.calculate_plan_cost(result.plan)
+                candidates_with_plans.append((sql, signature, cost))
+            else:
+                candidates_with_plans.append((sql, "ERROR", -1))
+
+        # Plan-based majority voting
+        winning_sql, winning_sig, vote_stats = vote_by_plan(candidates_with_plans)
+
+        # Add M19-specific metadata
+        vote_stats["strategy"] = "M19_ExampleGuided"
+        vote_stats["detected_patterns"] = detected_patterns
+        vote_stats["selected_examples"] = [ex.pattern_type for ex in selected_examples]
+        vote_stats["schema_augmentation_time_ms"] = schema_time
+        vote_stats["num_samples"] = num_samples
+
+        error_history.append(f"Detected patterns: {detected_patterns}")
+        error_history.append(f"Selected examples: {[ex.pattern_type for ex in selected_examples]}")
         error_history.append(f"Vote stats: {vote_stats}")
 
         total_time = (time.perf_counter() - start_time) * 1000
