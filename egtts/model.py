@@ -124,15 +124,15 @@ def load_model(
         if quantization_config:
             load_kwargs["quantization_config"] = quantization_config
         elif use_auto_dtype:
-            load_kwargs["torch_dtype"] = "auto"
+            load_kwargs["dtype"] = "auto"
         else:
-            load_kwargs["torch_dtype"] = dtype
+            load_kwargs["dtype"] = dtype
 
         model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype="auto" if use_auto_dtype else dtype,
+            dtype="auto" if use_auto_dtype else dtype,
             trust_remote_code=True,
         )
         model = model.to(device)
