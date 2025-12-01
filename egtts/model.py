@@ -19,19 +19,46 @@ if TYPE_CHECKING:
 # Type alias for chat messages
 ChatMessage = dict[str, str]
 
-# Arctic-Text2SQL system prompt (from paper Appendix C)
-ARCTIC_SYSTEM_PROMPT = """You are a data science expert. Below, you are provided with a database schema and a natural language question. Your task is to understand the schema and generate a valid SQL query to answer the question.
+# OmniSQL/Arctic prompt template (exact format from OmniSQL model card)
+# Arctic was fine-tuned from OmniSQL and uses the same prompt format
+OMNISQL_PROMPT_TEMPLATE = """Task Overview:
+You are a data science expert. Below, you are provided with a database schema and a natural language question. Your task is to understand the schema and generate a valid SQL query to answer the question.
 
-Database Engine: SQLite
+Database Engine:
+SQLite
+
+Database Schema:
+{db_details}
+This schema describes the database's structure, including tables, columns, primary keys, foreign keys, and any relevant relationships or constraints.
+
+Question:
+{question}
 
 Instructions:
-- Output only information that is explicitly asked for
-- If the question asks for specific column(s), ensure your query returns exactly those column(s)
-- Return complete information without gaps or extras
-- Think through query construction steps beforehand"""
+- Make sure you only output the information that is asked in the question. If the question asks for a specific column, make sure to only include that column in the SELECT clause, nothing more.
+- The generated query should return all of the information asked in the question without any missing or extra information.
+- Before generating the final SQL query, please think through the steps of how to write the query.
 
-# Models that require Arctic-style prompting
-ARCTIC_STYLE_MODELS = {"arctic-text2sql", "snowflake/arctic-text2sql-r1-7b"}
+Output Format:
+In your answer, please enclose the generated SQL query in a code block:
+```sql
+-- Your SQL query
+```
+
+Take a deep breath and think step by step to find the correct SQL query."""
+
+# Legacy system prompt (kept for reference)
+ARCTIC_SYSTEM_PROMPT = OMNISQL_PROMPT_TEMPLATE  # Alias for backwards compatibility
+
+# Models that require OmniSQL-style prompting (Arctic was trained from OmniSQL)
+ARCTIC_STYLE_MODELS = {
+    "arctic-text2sql",
+    "snowflake/arctic-text2sql-r1-7b",
+    "omnisql-7b",
+    "seeklhy/omnisql-7b",
+    "seeklhy/omnisql-14b",
+    "seeklhy/omnisql-32b",
+}
 
 
 def is_arctic_model(model_name: str) -> bool:
@@ -197,10 +224,10 @@ def create_arctic_prompt(
     evidence: str | None = None,
 ) -> str | list[ChatMessage]:
     """
-    Create a prompt for Arctic-Text2SQL model.
+    Create a prompt for Arctic-Text2SQL / OmniSQL models.
 
-    Arctic was trained with a specific format including system prompt,
-    and expects output in <think> and <answer> tags.
+    Uses the exact OmniSQL prompt format that Arctic was trained with.
+    This is a single user message with the full template filled in.
 
     Args:
         question: Natural language question
@@ -211,18 +238,17 @@ def create_arctic_prompt(
     Returns:
         Formatted prompt string (if tokenizer provided) or messages list
     """
-    # Build user message with schema and question
-    user_parts: list[str] = [f"Schema:\n{schema}"]
+    # Build the full question with evidence if provided
+    full_question = f"{question}\nHint: {evidence}" if evidence else question
 
-    if evidence:
-        user_parts.append(f"\nHint: {evidence}")
+    # Fill in the OmniSQL template
+    user_message = OMNISQL_PROMPT_TEMPLATE.format(
+        db_details=schema,
+        question=full_question,
+    )
 
-    user_parts.append(f"\nQuestion: {question}")
-
-    user_message = "\n".join(user_parts)
-
+    # OmniSQL uses a single user message, no system message
     messages: list[ChatMessage] = [
-        {"role": "system", "content": ARCTIC_SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
     ]
 

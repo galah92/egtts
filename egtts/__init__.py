@@ -6,6 +6,7 @@ from .guided import ExplainGuidedGenerator, GenerationResult
 from .model import (
     ARCTIC_SYSTEM_PROMPT,
     MODEL_PRESETS,
+    OMNISQL_PROMPT_TEMPLATE,
     create_arctic_prompt,
     create_sql_prompt,
     extract_sql_from_arctic_response,
@@ -33,6 +34,7 @@ __all__ = [
     "is_arctic_model",
     "MODEL_PRESETS",
     "ARCTIC_SYSTEM_PROMPT",
+    "OMNISQL_PROMPT_TEMPLATE",
     # Schema utilities
     "SchemaIndex",
     "build_schema_index",
