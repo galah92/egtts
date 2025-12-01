@@ -88,5 +88,7 @@ def download_bird():
     return data_list
 
 
+main = download_bird  # Entry point alias
+
 if __name__ == "__main__":
     download_bird()

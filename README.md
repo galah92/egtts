@@ -42,10 +42,10 @@ When generating multiple SQL candidates, wrong answers produce unique execution 
 ```bash
 # Install dependencies
 uv sync
-uv run python scripts/download_bird.py
+uv run python -m egtts.scripts.download_bird
 
 # Run best strategy (M10)
-uv run python scripts/run_bird_ves.py \
+uv run python -m egtts.scripts.run_bird_ves \
   --strategy M10 \
   --limit 50 \
   --data-dir data/bird \
@@ -125,21 +125,19 @@ best_sql = min(winner_cluster, key=lambda c: c.cost)
 
 ```
 egtts/
-├── src/egtts/
+├── egtts/
 │   ├── model.py      # Model loading, SQL generation
 │   ├── database.py   # EXPLAIN QUERY PLAN validation
 │   ├── guided.py     # Strategy implementations (M4, M7, M8, M10, M12)
 │   ├── plans.py      # Plan normalization and voting
 │   ├── schema.py     # Schema utilities and augmentation
-│   └── data.py       # Dataset loading utilities
+│   ├── data.py       # Dataset loading utilities
+│   └── scripts/      # CLI tools (run with python -m egtts.scripts.*)
+│       ├── run_bird_ves.py
+│       ├── analyze_failures.py
+│       └── download_bird.py
 │
-├── scripts/
-│   ├── run_bird_ves.py       # Main benchmark runner
-│   ├── analyze_failures.py   # Failure analysis
-│   ├── calculate_rves.py     # R-VES calculator
-│   └── download_bird.py      # Dataset downloader
-│
-└── results/                  # Evaluation outputs
+└── results/          # Evaluation outputs
 ```
 
 ## Failure Analysis
