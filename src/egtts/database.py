@@ -1,15 +1,27 @@
 """Database utilities for non-destructive SQL verification using EXPLAIN."""
 
+from __future__ import annotations
+
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypedDict
+
+
+class PlanRow(TypedDict):
+    """A single row from EXPLAIN QUERY PLAN output."""
+
+    id: int
+    parent: int
+    notused: int
+    detail: str
 
 
 @dataclass
 class ExplainSuccess:
     """Successful EXPLAIN result with query plan."""
-    plan: list[dict]
+
+    plan: list[PlanRow]
     execution_time_ms: float
     status: Literal["success"] = "success"
 
@@ -17,13 +29,17 @@ class ExplainSuccess:
 @dataclass
 class ExplainError:
     """Error result from EXPLAIN with specific error details."""
+
     error_type: str
     error_message: str
     execution_time_ms: float
     status: Literal["error"] = "error"
 
 
-def explain_query(sql: str, db_path: str) -> ExplainSuccess | ExplainError:
+ExplainResult = ExplainSuccess | ExplainError
+
+
+def explain_query(sql: str, db_path: str) -> ExplainResult:
     """
     Execute EXPLAIN QUERY PLAN on SQL without running the actual query.
 
@@ -49,23 +65,15 @@ def explain_query(sql: str, db_path: str) -> ExplainSuccess | ExplainError:
         plan_rows = cursor.fetchall()
 
         # Parse plan into structured format
-        plan = [
-            {
-                "id": row[0],
-                "parent": row[1],
-                "notused": row[2],
-                "detail": row[3]
-            }
+        plan: list[PlanRow] = [
+            PlanRow(id=row[0], parent=row[1], notused=row[2], detail=row[3])
             for row in plan_rows
         ]
 
         conn.close()
         execution_time = (time.perf_counter() - start_time) * 1000
 
-        return ExplainSuccess(
-            plan=plan,
-            execution_time_ms=execution_time
-        )
+        return ExplainSuccess(plan=plan, execution_time_ms=execution_time)
 
     except sqlite3.OperationalError as e:
         # Schema errors: "no such table", "no such column", etc.
@@ -73,7 +81,7 @@ def explain_query(sql: str, db_path: str) -> ExplainSuccess | ExplainError:
         return ExplainError(
             error_type="OperationalError",
             error_message=str(e),
-            execution_time_ms=execution_time
+            execution_time_ms=execution_time,
         )
 
     except sqlite3.Error as e:
@@ -82,7 +90,7 @@ def explain_query(sql: str, db_path: str) -> ExplainSuccess | ExplainError:
         return ExplainError(
             error_type=type(e).__name__,
             error_message=str(e),
-            execution_time_ms=execution_time
+            execution_time_ms=execution_time,
         )
 
     finally:

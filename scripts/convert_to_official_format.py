@@ -26,7 +26,6 @@ Our format:
 
 import argparse
 import json
-from pathlib import Path
 
 
 def convert_to_official_format(results_path: str, output_path: str) -> None:
@@ -37,20 +36,20 @@ def convert_to_official_format(results_path: str, output_path: str) -> None:
         results_path: Path to our results JSON file
         output_path: Path to save converted JSON file
     """
-    with open(results_path, 'r') as f:
+    with open(results_path, "r") as f:
         data = json.load(f)
 
     # Convert to official format
     official_format = {}
 
-    for example in data['examples']:
-        idx = example['index']
-        db_id = example['db_id']
+    for example in data["examples"]:
+        idx = example["index"]
+        db_id = example["db_id"]
 
         # Handle cases where prediction failed
-        if 'predicted_sql' in example:
-            sql = example['predicted_sql']
-        elif 'error' in example:
+        if "predicted_sql" in example:
+            sql = example["predicted_sql"]
+        elif "error" in example:
             # Use a dummy query for failed predictions
             sql = "SELECT 1"  # Will fail execution but won't crash evaluation
         else:
@@ -60,7 +59,7 @@ def convert_to_official_format(results_path: str, output_path: str) -> None:
         official_format[str(idx)] = f"{sql}\t----- bird -----\t{db_id}"
 
     # Write output
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         json.dump(official_format, f, indent=4)
 
     print(f"✓ Converted {len(official_format)} predictions")
@@ -73,16 +72,10 @@ def main():
         description="Convert EGTTS results to official BIRD evaluation format"
     )
     parser.add_argument(
-        "--input",
-        type=str,
-        required=True,
-        help="Path to our results JSON file"
+        "--input", type=str, required=True, help="Path to our results JSON file"
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Path to save converted JSON file"
+        "--output", type=str, required=True, help="Path to save converted JSON file"
     )
 
     args = parser.parse_args()
@@ -90,5 +83,5 @@ def main():
     convert_to_official_format(args.input, args.output)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

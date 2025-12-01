@@ -9,15 +9,15 @@ from pathlib import Path
 
 def create_ground_truth_sql(data_path: str, output_path: str):
     """Create ground truth SQL file from mini_dev JSON."""
-    with open(data_path, 'r') as f:
+    with open(data_path, "r") as f:
         data = json.load(f)
 
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         for example in data:
-            sql = example['SQL']
-            db_id = example['db_id']
+            sql = example["SQL"]
+            db_id = example["db_id"]
             # Write SQL on single line with tab separator and db_id
-            sql_single_line = ' '.join(sql.replace('\n', ' ').split())
+            sql_single_line = " ".join(sql.replace("\n", " ").split())
             f.write(f"{sql_single_line}\t{db_id}\n")
 
     print(f"✓ Created ground truth SQL: {output_path} ({len(data)} queries)")
@@ -25,18 +25,20 @@ def create_ground_truth_sql(data_path: str, output_path: str):
 
 def create_difficulty_jsonl(data_path: str, output_path: str):
     """Create difficulty JSONL file from mini_dev JSON."""
-    with open(data_path, 'r') as f:
+    with open(data_path, "r") as f:
         data = json.load(f)
 
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         for example in data:
             entry = {
-                "db_id": example['db_id'],
-                "difficulty": example.get('difficulty', 'moderate'),  # Default if missing
-                "question": example['question'],
-                "SQL": example['SQL']
+                "db_id": example["db_id"],
+                "difficulty": example.get(
+                    "difficulty", "moderate"
+                ),  # Default if missing
+                "question": example["question"],
+                "SQL": example["SQL"],
             }
-            f.write(json.dumps(entry) + '\n')
+            f.write(json.dumps(entry) + "\n")
 
     print(f"✓ Created difficulty JSONL: {output_path} ({len(data)} queries)")
 
@@ -63,5 +65,5 @@ def main():
     print(f"  Difficulty: {diff_jsonl_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

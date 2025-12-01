@@ -1,9 +1,12 @@
 """Schema indexing for fast lookup during generation."""
 
+from __future__ import annotations
+
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -52,18 +55,23 @@ def parse_create_table(create_stmt: str) -> tuple[str, list[str]]:
 
     Returns:
         Tuple of (table_name, column_names)
+
+    Raises:
+        ValueError: If the table name cannot be parsed from the statement
     """
     # Extract table name
-    table_match = re.search(r"CREATE TABLE\s+['\"]?(\w+)['\"]?\s*\(", create_stmt, re.IGNORECASE)
+    table_match = re.search(
+        r"CREATE TABLE\s+['\"]?(\w+)['\"]?\s*\(", create_stmt, re.IGNORECASE
+    )
     if not table_match:
         raise ValueError(f"Could not parse table name from: {create_stmt[:100]}")
 
-    table_name = table_match.group(1)
+    table_name: str = table_match.group(1)
 
     # Extract column names - match word followed by type/constraints
     # This matches: column_name TYPE ... or column_name, or column_name )
     column_pattern = r"['\"]?(\w+)['\"]?\s+(?:INTEGER|TEXT|REAL|BLOB|NUMERIC|VARCHAR|INT|CHAR|BOOLEAN|DATE|DATETIME|TIMESTAMP|DECIMAL|FLOAT|DOUBLE)"
-    columns = re.findall(column_pattern, create_stmt, re.IGNORECASE)
+    columns: list[str] = re.findall(column_pattern, create_stmt, re.IGNORECASE)
 
     # Also catch primary key definitions like "id INTEGER PRIMARY KEY"
     # The pattern above should catch these, but let's also check for standalone column definitions
@@ -90,12 +98,12 @@ def build_schema_index(db_path: str | Path) -> SchemaIndex:
 
     # Get all tables
     cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
-    table_data = cursor.fetchall()
+    table_data: list[tuple[str, str | None]] = cursor.fetchall()
     conn.close()
 
-    tables = set()
-    columns_by_table = {}
-    all_columns = set()
+    tables: set[str] = set()
+    columns_by_table: dict[str, set[str]] = {}
+    all_columns: set[str] = set()
 
     for table_name, create_stmt in table_data:
         if create_stmt is None:
@@ -113,7 +121,7 @@ def build_schema_index(db_path: str | Path) -> SchemaIndex:
             conn = sqlite3.connect(str(db_path))
             cursor = conn.cursor()
             cursor.execute(f"PRAGMA table_info({table_name})")
-            pragma_cols = [row[1] for row in cursor.fetchall()]
+            pragma_cols: list[str] = [row[1] for row in cursor.fetchall()]
             conn.close()
 
             columns_by_table[table_name] = set(pragma_cols)
@@ -127,9 +135,7 @@ def build_schema_index(db_path: str | Path) -> SchemaIndex:
 
 
 def get_augmented_schema(
-    db_path: str | Path,
-    max_rows_per_table: int = 3,
-    max_schema_chars: int = 8000
+    db_path: str | Path, max_rows_per_table: int = 3, max_schema_chars: int = 8000
 ) -> str:
     """
     Generate augmented schema with sample rows for each table.
@@ -151,10 +157,12 @@ def get_augmented_schema(
     cursor = conn.cursor()
 
     # Get all tables with their CREATE statements
-    cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
-    tables = cursor.fetchall()
+    cursor.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+    )
+    tables: list[tuple[str, str | None]] = cursor.fetchall()
 
-    schema_parts = []
+    schema_parts: list[str] = []
 
     for table_name, create_stmt in tables:
         if create_stmt is None:
@@ -165,7 +173,7 @@ def get_augmented_schema(
 
         # Get column names
         cursor.execute(f"PRAGMA table_info(`{table_name}`)")
-        columns = [row[1] for row in cursor.fetchall()]
+        columns: list[str] = [row[1] for row in cursor.fetchall()]
 
         if not columns:
             schema_parts.append("")
@@ -174,7 +182,7 @@ def get_augmented_schema(
         # Get sample rows
         try:
             cursor.execute(f"SELECT * FROM `{table_name}` LIMIT {max_rows_per_table}")
-            rows = cursor.fetchall()
+            rows: list[tuple[Any, ...]] = cursor.fetchall()
 
             if rows:
                 # Format as comment with sample data
@@ -184,7 +192,7 @@ def get_augmented_schema(
 
                 for row in rows:
                     # Format values, handling None and strings
-                    formatted_values = []
+                    formatted_values: list[str] = []
                     for val in row:
                         if val is None:
                             formatted_values.append("NULL")
@@ -209,7 +217,9 @@ def get_augmented_schema(
         # Rebuild without sample data
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
-        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
+        cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
         tables = cursor.fetchall()
         conn.close()
 

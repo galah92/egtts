@@ -47,31 +47,31 @@ def calculate_rves(results_path: str) -> dict:
     Returns:
         Dictionary with R-VES metrics
     """
-    with open(results_path, 'r') as f:
+    with open(results_path, "r") as f:
         data = json.load(f)
 
     total_reward_score = 0.0
-    num_queries = len(data['examples'])
+    num_queries = len(data["examples"])
     correct_count = 0
     reward_distribution = {
-        '0.00': 0,     # Incorrect
-        '0.25': 0,     # Very slow (< 0.25x)
-        '0.50': 0,     # Slow (0.25-0.5x)
-        '0.75': 0,     # Slightly slower (0.5-1x)
-        '1.00': 0,     # Similar speed (1-2x)
-        '1.25': 0,     # Much faster (>= 2x)
+        "0.00": 0,  # Incorrect
+        "0.25": 0,  # Very slow (< 0.25x)
+        "0.50": 0,  # Slow (0.25-0.5x)
+        "0.75": 0,  # Slightly slower (0.5-1x)
+        "1.00": 0,  # Similar speed (1-2x)
+        "1.25": 0,  # Much faster (>= 2x)
     }
 
-    for result in data['examples']:
+    for result in data["examples"]:
         # Failed queries have 'error' field instead of 'correctness'
-        if 'error' in result:
+        if "error" in result:
             is_correct = False
         else:
-            is_correct = result.get('correctness') == 'correct'
+            is_correct = result.get("correctness") == "correct"
 
         if is_correct:
-            gold_time = result['gold_exec_time_ms']
-            pred_time = result['pred_exec_time_ms']
+            gold_time = result["gold_exec_time_ms"]
+            pred_time = result["pred_exec_time_ms"]
 
             # Calculate time ratio (gold / pred)
             # If pred is faster, ratio > 1
@@ -94,21 +94,21 @@ def calculate_rves(results_path: str) -> dict:
     rves = total_reward_score / num_queries
 
     return {
-        'strategy': data['strategy'],
-        'total_examples': num_queries,
-        'correct': correct_count,
-        'incorrect': num_queries - correct_count,
-        'rves': rves,
-        'reward_distribution': reward_distribution,
-        'avg_generation_time_ms': data.get('avg_generation_time_ms', 0),
+        "strategy": data["strategy"],
+        "total_examples": num_queries,
+        "correct": correct_count,
+        "incorrect": num_queries - correct_count,
+        "rves": rves,
+        "reward_distribution": reward_distribution,
+        "avg_generation_time_ms": data.get("avg_generation_time_ms", 0),
     }
 
 
 def main():
     """Calculate R-VES for baseline and M4 strategies."""
 
-    baseline_path = Path('results/bird_ves_baseline_500.json')
-    m4_path = Path('results/bird_ves_M4_500.json')
+    baseline_path = Path("results/bird_ves_baseline_500.json")
+    m4_path = Path("results/bird_ves_M4_500.json")
 
     print("=" * 80)
     print("R-VES CALCULATION (Reward-based Valid Efficiency Score)")
@@ -125,8 +125,8 @@ def main():
         print(f"  Avg Gen Time:      {baseline_rves['avg_generation_time_ms']:.0f}ms")
         print()
         print("  Reward Distribution:")
-        for reward, count in sorted(baseline_rves['reward_distribution'].items()):
-            pct = count / baseline_rves['total_examples'] * 100
+        for reward, count in sorted(baseline_rves["reward_distribution"].items()):
+            pct = count / baseline_rves["total_examples"] * 100
             print(f"    {reward}: {count:3d} ({pct:5.1f}%)")
         print()
     else:
@@ -143,8 +143,8 @@ def main():
         print(f"  Avg Gen Time:      {m4_rves['avg_generation_time_ms']:.0f}ms")
         print()
         print("  Reward Distribution:")
-        for reward, count in sorted(m4_rves['reward_distribution'].items()):
-            pct = count / m4_rves['total_examples'] * 100
+        for reward, count in sorted(m4_rves["reward_distribution"].items()):
+            pct = count / m4_rves["total_examples"] * 100
             print(f"    {reward}: {count:3d} ({pct:5.1f}%)")
         print()
     else:
@@ -156,31 +156,34 @@ def main():
         print("COMPARISON: M4 vs Baseline")
         print("=" * 80)
 
-        rves_improvement = ((m4_rves['rves'] - baseline_rves['rves']) /
-                           baseline_rves['rves'] * 100)
-        rves_pp_improvement = m4_rves['rves'] - baseline_rves['rves']
+        rves_improvement = (
+            (m4_rves["rves"] - baseline_rves["rves"]) / baseline_rves["rves"] * 100
+        )
+        rves_pp_improvement = m4_rves["rves"] - baseline_rves["rves"]
 
-        print(f"R-VES Improvement:  {rves_improvement:+.1f}% relative "
-              f"({rves_pp_improvement:+.2f} points absolute)")
+        print(
+            f"R-VES Improvement:  {rves_improvement:+.1f}% relative "
+            f"({rves_pp_improvement:+.2f} points absolute)"
+        )
         print()
 
         # Save comparison to file
         comparison = {
-            'baseline': baseline_rves,
-            'm4': m4_rves,
-            'improvements': {
-                'rves_relative_pct': rves_improvement,
-                'rves_absolute_points': rves_pp_improvement,
-            }
+            "baseline": baseline_rves,
+            "m4": m4_rves,
+            "improvements": {
+                "rves_relative_pct": rves_improvement,
+                "rves_absolute_points": rves_pp_improvement,
+            },
         }
 
-        output_path = Path('/tmp/rves_comparison.json')
-        with open(output_path, 'w') as f:
+        output_path = Path("/tmp/rves_comparison.json")
+        with open(output_path, "w") as f:
             json.dump(comparison, f, indent=2)
 
         print(f"Detailed results saved to: {output_path}")
         print()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

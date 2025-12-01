@@ -1,189 +1,50 @@
 # EGTTS: Execution-Guided Text-to-SQL
 
-**Improving SQL Query Accuracy Through Plan-Based Consensus Voting**
-
 A research project exploring inference-time scaling for Text-to-SQL. We achieve **53.6% accuracy** on BIRD Mini-Dev (up from 41.6% baseline) using schema augmentation with plan-based majority voting.
 
-**Model:** Qwen2.5-Coder-7B-Instruct
-**Best Strategy:** M10 (Schema Augmentation + Plan Voting)
-**Dataset:** BIRD Mini-Dev (500 examples with realistic databases)
+- **Model**: Qwen2.5-Coder-7B-Instruct
+- **Best Strategy**: M10 (Schema Augmentation + Plan Voting)
+- **Dataset**: BIRD Mini-Dev (500 examples)
 
----
+## Core Insight
 
-## Key Results
+> Hallucinations are fragile, correct answers are stable.
 
-### Strategy Comparison (50 examples)
+When generating multiple SQL candidates, wrong answers produce unique execution plans while correct answers converge on the same plan. By voting for the most common plan signature, we select stable (correct) queries.
 
-| Strategy | Accuracy | VES | Description |
-|----------|----------|-----|-------------|
-| Baseline | 41.6% | 0.416 | Greedy decoding |
-| M4 | 45.3% | 0.518 | Cost-aware beam selection |
-| M7 | 59.0% | 0.557 | Plan-based voting (5 beams) |
-| M8 | 60.0% | 0.544 | Massive diversity (32 samples) |
-| M9 | 52.0% | 0.476 | Few-shot + simulation filter |
-| **M10** | **62.0%** | 0.596 | **Schema augmentation + plan voting** |
-| M11 | 30.0% | 0.702 | Chain-of-thought (failed - batch errors) |
-| M12 | 58.0% | 0.557 | Execution-based self-correction |
-| M14 | 34.0% | 0.505 | Data Flow CoT (failed - batch errors) |
-| M15 | 42.0% | - | Incremental consensus (failed - error propagation) |
+## Results
 
-### Full Benchmark (500 examples)
+### Strategy Comparison
 
-| Strategy | Accuracy | VES | R-VES |
-|----------|----------|-----|-------|
-| Baseline | 41.8% | 0.500 | 37.62 |
-| M7 | 51.2% | 0.472 | - |
-| **M10** | **53.6%** | 0.506 | - |
+| Strategy | Accuracy | Description |
+|----------|----------|-------------|
+| Baseline | 41.6% | Greedy decoding |
+| M4 | 45.3% | Cost-aware beam selection |
+| M7 | 51.2% | Plan-based voting (5 beams) |
+| M8 | 60.0%* | Massive diversity (32 samples) |
+| **M10** | **53.6%** | **Schema augmentation + plan voting** |
+| M12 | 58.0%* | Execution-based self-correction |
 
-**Best improvement: +12.0 percentage points** (41.6% → 53.6%)
+*Results on 50-example subset; M10's 53.6% is on full 500 examples.
 
----
+### Failed Experiments
 
-## Strategy Evolution
-
-### M4: Cost-Aware Selection
-- Generate 5 candidates with beam search
-- Score with EXPLAIN QUERY PLAN cost
-- Select lowest-cost valid query
-- **Result:** +3.5% accuracy, +3.6% VES
-
-### M7: Plan-Based Majority Voting
-- Generate 5 diverse candidates
-- Validate with EXPLAIN
-- Cluster by plan signature
-- Vote for largest cluster, tie-break by cost
-- **Result:** +17.4% accuracy
-
-### M8: Massive Diversity Plan-Bagging (Best)
-- Generate 32 candidates with temperature sampling (T=0.7)
-- OOM-safe batching (falls back to 2×16 if needed)
-- Validate, cluster by plan signature
-- Vote for consensus cluster
-- **Result:** +18.4% accuracy
-
-### M9: Few-Shot + Simulation Filter (Failed Experiment)
-- Added domain-specific few-shot examples
-- Simulation filter for "chatty" queries (wrong column count)
-- **Result:** -8% vs M8 (few-shot hurt performance)
-
-### M10: Schema Augmentation (Best - 53.6%)
-- Include sample data rows in the prompt (3 rows per table)
-- Helps model understand actual data formats (e.g., Date='201301' not '2013-01-01')
-- Plan-based majority voting on top
-- **Result:** +2.4% over M7 (51.2% → 53.6%)
-
-### M11: Chain-of-Thought (Failed Experiment)
-- Force structured reasoning before SQL generation
-- Uses "-- Reasoning:" followed by "-- SQL:" format
-- **Result:** Failed due to tensor size mismatch errors in batch generation
-- Variable-length CoT prompts incompatible with batching
-- Only 30% accuracy (vs 62% M10) on 50 examples
-
-### M12: Execution-Based Self-Correction
-- Execute queries and check if results are empty
-- If 0 rows returned: provide feedback and regenerate
-- Up to 2 correction iterations
-- **Result:** 58% accuracy - slightly worse than M10 (62%)
-- Most failures return data (just wrong data), so execution check doesn't help
-
-### M14: Data Flow Chain-of-Thought (Failed Experiment)
-- Structured 4-step execution-order planning (FROM → WHERE → GROUP BY → SELECT)
-- Hypothesis: SQL's SELECT-first syntax conflicts with logical dependencies
-- Used 2 few-shot examples + schema augmentation + plan voting (16 samples)
-- **Result:** 34% accuracy (17 correct, 15 incorrect, 18 failed)
-- Same tensor size mismatch errors as M11 (36% failure rate)
-- Hypothesis disproven: Execution-order planning doesn't help 7B models
-
-### M15: Incremental Consensus Generation (MAKER) - Failed Experiment
-- Decomposes SQL into 3 atomic phases with voting at each stage (36 calls per query)
-- Phase 1: Table Selection (FROM/JOIN) with EXPLAIN validation - locks table scope
-- Phase 2: Filter Generation (WHERE) with string voting - locks filter logic
-- Phase 3: Projection (SELECT/GROUP BY) with plan voting - completes query
-- Uses M10's augmented schema + M7's plan voting
-- **Hypothesis:** By locking tables via consensus first, we prevent column hallucinations
-- **Result:** 42% accuracy - **10% worse than M10 (52%)**
-- **Why it failed:** SQL generation is holistic, not decomposable. Phase 1 added unnecessary JOINs (9/12 consensus on wrong tables). Errors propagated through phases. Context loss between phases hurt semantics (e.g., missed `/12` for monthly averages). 2.4x slower with worse accuracy.
-
----
-
-## Experimental Strategies (M19-M25)
-
-These strategies explore execution-guided generation inspired by the [EG-CFG paper](https://arxiv.org/abs/2506.10948) and BIRD benchmark papers like TA-SQL.
-
-### M19: Example-Guided (DAIL-SQL inspired) - Best Experimental
-- Select similar examples from the same database using question similarity
-- Provide 3-5 few-shot examples with schema context
-- **Result:** 60% accuracy on 10 examples - **Best experimental strategy**
-- **Why it works:** Examples implicitly teach correct table/column names
-
-### M20: Token-Level CFG Constrained Decoding - Failed Experiment
-- Apply CFG-style guidance at token level during generation
-- Validate partial SQL with EXPLAIN during decoding
-- **Result:** 33% accuracy - incomplete SQL generation issues
-- Token-by-token validation too granular for SQL structure
-
-### M21: Schema-Aware Reranking
-- Generate multiple candidates with temperature sampling
-- Rerank by schema validity (correct table/column references)
-- **Result:** 40% accuracy on 10 examples
-- Schema validation alone insufficient
-
-### M22: Execution-Guided Validation
-- Generate candidates and validate with EXPLAIN
-- Use partial SQL completion for validation during generation
-- **Result:** 50% accuracy on 10 examples
-- Binary pass/fail feedback not informative enough
-
-### M23: Example-Guided + Execution-Validated (Combined)
-- Combine M19's example selection with M22's validation
-- **Result:** 50% accuracy on 10 examples - same as M22
-- Validation didn't improve over example-guided alone
-
-### M24: Task-Aligned SQL (TA-SQL inspired) - Failed Experiment
-- Generate "dummy SQL" first for schema linking (TASL)
-- Frame SQL as step-by-step data analysis (TALOG)
-- **Result:** 40% accuracy on 5 examples
-- **Why it failed:** Intermediate "dummy SQL" step caused hallucinations (e.g., hallucinated non-existent tables). TA-SQL designed for GPT-4, not 7B models.
-
-### M25: EG-CFG Execution-Guided Generation - Experimental
-- Based on [EG-CFG paper](https://arxiv.org/abs/2506.10948) methodology
-- Generate multiple candidates with execution scoring
-- Score by: syntax validity, table validity, column validity, execution success
-- **Status:** Experimental - slow due to multiple candidate generation
-
-### Why Execution Guidance Works Differently for SQL vs Code
-
-The EG-CFG paper achieved excellent results for code generation (83.2% on MBPP with 1.3B model). However, execution guidance doesn't transfer directly to SQL for several reasons:
-
-| Aspect | Code (EG-CFG) | SQL (Our attempts) |
-|--------|---------------|---------------------|
-| **Test cases** | Input/output pairs available | No test cases, only DB schema |
-| **Execution trace** | Rich: variables, line numbers, values | Poor: pass/fail from EXPLAIN |
-| **Partial execution** | Meaningful (partial programs run) | Limited (partial SQL rarely informative) |
-| **Error localization** | Line-level errors guide fixes | Schema errors = immediate rejection |
-| **Semantic feedback** | Can check output matches expected | No expected output to compare |
-
-**Key insight:** EG-CFG relies on test cases to provide semantic feedback during generation. Without expected results, we can only validate syntax - which isn't the bottleneck for modern LLMs.
-
-**Best approach for SQL:** Example-guided (M19) at 60% accuracy, because:
-1. Schema knowledge embedded in examples
-2. No intermediate steps that can hallucinate
-3. Pattern transfer from similar questions
-
----
+| Strategy | Accuracy | Why It Failed |
+|----------|----------|---------------|
+| M9 | 52.0% | Few-shot examples hurt generalization |
+| M11 | 30.0% | Chain-of-thought broke batch generation |
+| M14 | 34.0% | Data flow CoT had same batching issues |
+| M15 | 42.0% | Incremental consensus caused error propagation |
+| EG-SQL | 10.0% | Real-time steering fragmented SQL generation |
 
 ## Quick Start
 
-### Installation
-
 ```bash
+# Install dependencies
 uv sync
 uv run python scripts/download_bird.py
-```
 
-### Run Best Strategy (M10)
-
-```bash
+# Run best strategy (M10)
 uv run python scripts/run_bird_ves.py \
   --strategy M10 \
   --limit 50 \
@@ -194,78 +55,54 @@ uv run python scripts/run_bird_ves.py \
 ### Available Strategies
 
 ```bash
-# Baseline (greedy decoding)
---strategy baseline
-
-# M4 (cost-aware selection)
---strategy M4
-
-# M7 (plan-based voting, 5 beams)
---strategy M7
-
-# M8 (massive diversity, 32 samples)
---strategy M8
-
-# M9 (few-shot + simulation)
---strategy M9
-
-# M10 (schema augmentation) - BEST
---strategy M10
-
-# M11 (chain-of-thought)
---strategy M11
-
-# M12 (execution-based self-correction)
---strategy M12
-
-# M14 (data flow chain-of-thought)
---strategy M14
-
-# M15 (incremental consensus - MAKER)
-uv run python scripts/run_bird_m15.py --limit 50 --samples-per-phase 12
+--strategy baseline  # Greedy decoding
+--strategy M4        # Cost-aware selection
+--strategy M7        # Plan-based voting
+--strategy M8        # Massive diversity (32 samples)
+--strategy M10       # Schema augmentation (best)
+--strategy M12       # Execution-based self-correction
 ```
 
----
+## Strategy Details
 
-## Failure Analysis
+### M4: Cost-Aware Selection
+Generate 5 candidates with beam search, score with `EXPLAIN QUERY PLAN` cost, select lowest-cost valid query.
 
-We analyzed failures to understand *why* the system fails:
+### M7: Plan-Based Majority Voting
+Generate 5 diverse candidates, validate with EXPLAIN, cluster by plan signature, vote for largest cluster with cost tie-breaking.
 
-### Diagnosis Matrix
+### M8: Massive Diversity
+Generate 32 candidates with temperature sampling (T=0.7), OOM-safe batching, plan-based voting on valid queries.
 
-| Failure Type | % of Failures | Description | Fix |
-|--------------|---------------|-------------|-----|
-| **Generation** | 80% | Correct SQL not in any beam | Better prompting/fine-tuning |
-| **Selection** | 20% | Correct SQL in beams but wrong pick | Better ranking |
+### M10: Schema Augmentation (Best)
+Include 3 sample data rows per table in the prompt. This helps the model understand actual data formats (e.g., `Date='201301'` not `'2013-01-01'`). Combined with plan-based voting.
 
-### Common Generation Failure Patterns
+### M12: Execution-Based Self-Correction
+Execute queries and check results. If 0 rows returned, provide feedback and regenerate (up to 2 iterations). Limited benefit since most wrong queries return data.
 
-1. **Aggregation Confusion**: Model uses `ORDER BY col` instead of `ORDER BY SUM(col)`
-2. **Date Extraction**: Uses `SUBSTR(Date, 1, 7)` instead of `SUBSTR(Date, 5, 2)` for month
-3. **Complexity Wall**: Multi-segment comparisons beyond model capability
+## Failed Approaches
 
-### Key Finding
+### Chain-of-Thought (M11, M14)
+Structured reasoning before SQL generation caused tensor size mismatch errors in batch generation. Variable-length CoT prompts are incompatible with batching.
 
-The Selection Failure analysis showed correct SQL was present in **beam 17** for some failures - proving the value of diverse sampling. M8's 32-sample approach maximizes the chance of finding these "hidden" correct answers.
+### Incremental Consensus / MAKER (M15)
+Decomposed SQL into 3 phases (FROM → WHERE → SELECT) with voting at each stage. Failed because SQL generation is holistic—phase 1 added unnecessary JOINs, and errors propagated through phases.
 
----
+### EG-SQL (Execution-Guided Steering)
+Attempted real-time validation during generation. Achieved only 10% accuracy (vs 53% baseline) while being 11x slower. Root causes:
+- Multi-line SQL fragmentation (model treats newlines as completion points)
+- Token-count-based validation pruned valid beams mid-word
+- Speculative closure interfered with generation
+
+**Key lesson**: Post-hoc validation (generate then filter) beats real-time steering.
+
+### Few-Shot Prompting (M9)
+Domain-specific examples hurt generalization by 8%.
 
 ## Architecture
 
-### Core Insight
-
-**Hallucinations are fragile, correct answers are stable.**
-
-When generating multiple SQL candidates:
-- Wrong answers produce unique, "weird" execution plans
-- Correct answers converge on the same plan across samples
-
-By voting for the most common plan signature, we select stable (correct) queries.
-
 ### Plan Signature
-
 ```python
-# Normalize EXPLAIN QUERY PLAN output to a signature
 def normalize_plan(plan_rows):
     # Extract structure: tables, joins, scans, indexes
     signature = hash(canonical_plan_structure)
@@ -273,7 +110,6 @@ def normalize_plan(plan_rows):
 ```
 
 ### Voting Algorithm
-
 ```python
 # Cluster candidates by plan signature
 clusters = group_by(candidates, lambda c: c.plan_signature)
@@ -285,61 +121,50 @@ winner_cluster = max(clusters, key=len)
 best_sql = min(winner_cluster, key=lambda c: c.cost)
 ```
 
----
-
 ## Project Structure
 
 ```
 egtts/
 ├── src/egtts/
-│   ├── model.py         # Model loading, SQL generation
-│   ├── database.py      # EXPLAIN QUERY PLAN analysis
-│   ├── guided.py        # All strategies (M4-M14)
-│   ├── plans.py         # Plan normalization and voting
-│   ├── prompts.py       # Few-shot prompting and CoT (M9, M11, M14)
-│   └── schema.py        # Schema utilities and augmentation (M10)
+│   ├── model.py      # Model loading, SQL generation
+│   ├── database.py   # EXPLAIN QUERY PLAN validation
+│   ├── guided.py     # Strategy implementations (M4, M7, M8, M10, M12)
+│   ├── plans.py      # Plan normalization and voting
+│   ├── schema.py     # Schema utilities and augmentation
+│   └── data.py       # Dataset loading utilities
 │
 ├── scripts/
-│   ├── run_bird_ves.py              # Main benchmark runner
-│   ├── analyze_failures.py          # Basic failure analysis
-│   ├── analyze_failures_with_beams.py # Beam-level failure analysis
-│   ├── calculate_rves.py            # R-VES calculator
-│   └── download_bird.py             # Dataset downloader
+│   ├── run_bird_ves.py       # Main benchmark runner
+│   ├── analyze_failures.py   # Failure analysis
+│   ├── calculate_rves.py     # R-VES calculator
+│   └── download_bird.py      # Dataset downloader
 │
-└── results/
-    ├── bird_ves_M8_50.json          # Best results
-    ├── failure_report_M8.txt        # Failure analysis
-    └── failure_beam_report.txt      # Beam-level analysis
+└── results/                  # Evaluation outputs
 ```
 
----
+## Failure Analysis
 
-## Key Learnings
+### Diagnosis Matrix
 
-### What Worked
+| Failure Type | % of Failures | Description |
+|--------------|---------------|-------------|
+| Generation | 80% | Correct SQL not in any beam |
+| Selection | 20% | Correct SQL in beams but wrong pick |
 
-1. **Diversity beats optimization**: 32 random samples > 5 optimized beams
-2. **Plan-based voting**: Execution plan signatures are reliable correctness signals
-3. **Temperature sampling**: T=0.7 provides good diversity without being too random
-4. **OOM-safe batching**: Graceful fallback enables large sample counts
+### Common Patterns
+1. **Aggregation confusion**: `ORDER BY col` instead of `ORDER BY SUM(col)`
+2. **Date extraction**: Wrong substring indices for date components
+3. **Complexity wall**: Multi-segment comparisons beyond model capability
 
-### What Didn't Work
+## Model Size Experiments
 
-1. **Few-shot prompting (M9)**: Domain-specific examples hurt generalization (-8%)
-2. **Simulation filter**: Column count validation was too aggressive
-3. **Token-level steering**: SQL's declarative structure incompatible with real-time intervention
-4. **Chain-of-thought (M11, M14)**: Variable-length reasoning broke batch generation, 30-34% accuracy
-5. **Execution correction (M12)**: Most wrong queries return data, so empty-result check doesn't help
-6. **Execution-order planning (M14)**: Forcing FROM-first logic didn't improve over standard SQL syntax
-7. **EG-CFG for SQL (M20-M25)**: Execution guidance works for code (has test cases) but not SQL (no expected results)
+| Model | Quantization | Accuracy | Time/Example | Status |
+|-------|--------------|----------|--------------|--------|
+| 7B | FP16 | 62.0% | 14s | Default |
+| 14B | 4-bit | 64.0% | 37s | Works but slow |
+| 14B | 8-bit | - | - | OOM |
 
-### Scientific Conclusion
-
-**Inference-time scaling (more samples + consensus) beats prompt engineering for Text-to-SQL.**
-
-The model "knows" the correct answer but assigns it low probability. By sampling widely and voting, we find correct answers that greedy decoding misses.
-
----
+14B with 4-bit quantization provides +2% accuracy but 2.7x slower inference. Not recommended for default use.
 
 ## Metrics
 
@@ -349,65 +174,44 @@ VES = (gold_exec_time / pred_exec_time) if correct else 0
 ```
 
 ### R-VES (Reward-based VES)
-BIRD's official efficiency metric with tiered rewards:
-- `time_ratio ≥ 2.0` → reward = 1.25 (much faster)
-- `1.0 ≤ ratio < 2.0` → reward = 1.00 (similar)
-- `0.5 ≤ ratio < 1.0` → reward = 0.75 (slower)
-- `ratio < 0.25` → reward = 0.25 (very slow)
-- Incorrect → reward = 0.00
+BIRD's official efficiency metric with tiered rewards based on execution time ratio.
 
----
+## Key Learnings
 
-## Model Size Experiments
+### What Worked
+1. **Diversity beats optimization**: 32 random samples > 5 optimized beams
+2. **Plan-based voting**: Execution plan signatures are reliable correctness signals
+3. **Schema augmentation**: Sample data rows help understand data formats
+4. **OOM-safe batching**: Graceful fallback enables large sample counts
 
-We tested whether larger models improve accuracy with quantization to fit in GPU memory.
+### What Didn't Work
+1. **Real-time steering**: Post-hoc validation is simpler and more accurate
+2. **Chain-of-thought**: Variable-length reasoning breaks batching
+3. **Incremental decomposition**: SQL is holistic, not decomposable
+4. **Few-shot prompting**: Hurt generalization on this task
+5. **Execution feedback**: Most wrong queries return data (just wrong data)
 
-### 14B Model with Quantization (50 examples)
+### Scientific Conclusion
 
-| Model | Quantization | Accuracy | VES | Time/Example | Memory | Status |
-|-------|--------------|----------|-----|--------------|---------|---------|
-| 7B | FP16 | 62.0% | 0.596 | 14s | 14GB | ✅ Default |
-| 14B | 8-bit | - | - | - | 21GB+ | ❌ OOM during loading |
-| 14B | 4-bit | 64.0% | 0.775 | 37s | 14GB | ✅ Works but slow |
+**Inference-time scaling (more samples + consensus) beats prompt engineering for Text-to-SQL.**
 
-**Findings:**
-- **14B with 4-bit quantization works** on L4 GPU (23GB VRAM)
-- **+2% accuracy improvement** (62% → 64%), **+30% VES** (0.596 → 0.775)
-- **2.7x slower inference** (14s → 37s per example)
-- **Not recommended** for default use due to minimal accuracy gain vs significant speed cost
-
----
+The model "knows" the correct answer but assigns it low probability. By sampling widely and voting, we find correct answers that greedy decoding misses.
 
 ## Limitations
 
 1. **Generation ceiling**: 80% of failures have no correct SQL in 32 samples
-2. **Compute cost**: M8 is ~3× slower than baseline (32 samples vs 1)
+2. **Compute cost**: M8 is ~3x slower than baseline
 3. **SQLite-specific**: Plan analysis uses SQLite's EXPLAIN format
-4. **7B model optimal**: Larger models provide minimal accuracy gain (+2%) at high cost (2.7x slower)
-5. **Quantization required**: 14B models need 4-bit quantization to fit in 23GB VRAM
-
----
-
-## Future Work
-
-1. **Larger sample counts**: Test N=64, N=128 for diminishing returns analysis
-2. **Hybrid approaches**: Use M8 diversity with M9-style targeted examples
-3. **Weighted voting**: Weight votes by model confidence or plan cost
-4. **Error recovery**: When all samples fail, fall back to repair strategy
-5. **Distillation**: Distill 14B model knowledge into faster 7B model
-
----
+4. **7B model optimal**: Larger models provide minimal accuracy gain at high cost
 
 ## References
 
 - [BIRD Benchmark](https://bird-bench.github.io/) - Li et al., NeurIPS 2023
 - [Qwen2.5-Coder](https://github.com/QwenLM/Qwen2.5-Coder) - Alibaba Cloud
-- [Self-Consistency](https://arxiv.org/abs/2203.11171) - Wang et al., 2022 (inspiration for voting)
-- [EG-CFG: Execution Guided Line-by-Line Code Generation](https://arxiv.org/abs/2506.10948) - Lavon et al., 2024
-- [DAIL-SQL](https://arxiv.org/abs/2308.15363) - Gao et al., 2023 (inspiration for M19)
-- [TA-SQL: Task Alignment for Text-to-SQL](https://arxiv.org/abs/2402.12960) - ACL Findings 2024 (inspiration for M24)
-
----
+- [Self-Consistency](https://arxiv.org/abs/2203.11171) - Wang et al., 2022
+- [EG-CFG](https://arxiv.org/abs/2506.10948) - Lavon et al., 2024
+- [DAIL-SQL](https://arxiv.org/abs/2308.15363) - Gao et al., 2023
+- [TA-SQL](https://arxiv.org/abs/2402.12960) - ACL Findings 2024
 
 ## License
 

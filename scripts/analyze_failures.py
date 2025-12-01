@@ -29,6 +29,7 @@ from egtts.guided import ExplainGuidedGenerator
 @dataclass
 class FailureAnalysis:
     """Analysis of a single failure case."""
+
     index: int
     question: str
     gold_sql: str
@@ -40,8 +41,9 @@ class FailureAnalysis:
 def normalize_sql(sql: str) -> str:
     """Normalize SQL for comparison."""
     import re
-    sql = sql.strip().rstrip(';').lower()
-    sql = re.sub(r'\s+', ' ', sql)
+
+    sql = sql.strip().rstrip(";").lower()
+    sql = re.sub(r"\s+", " ", sql)
     return sql
 
 
@@ -86,9 +88,9 @@ def check_schema_errors(db_path: Path, sql: str) -> list[str]:
         import re
 
         # Look for "FROM table" or "JOIN table" patterns
-        table_refs = re.findall(r'(?:from|join)\s+(\w+)', sql_lower)
+        table_refs = re.findall(r"(?:from|join)\s+(\w+)", sql_lower)
         for ref in table_refs:
-            if ref not in tables and ref not in ['select', 'where', 'on', 'and', 'or']:
+            if ref not in tables and ref not in ["select", "where", "on", "and", "or"]:
                 errors.append(f"Unknown table: {ref}")
 
         return errors
@@ -168,7 +170,7 @@ def analyze_single_failure(
     pred_norm = normalize_sql(predicted_sql)
 
     # Check for aggregation mismatches
-    if ("sum(" in gold_norm or "count(" in gold_norm or "avg(" in gold_norm):
+    if "sum(" in gold_norm or "count(" in gold_norm or "avg(" in gold_norm:
         if "group by" in gold_norm and "group by" not in pred_norm:
             details["pattern"] = "Missing GROUP BY aggregation"
         elif "group by" not in gold_norm and "group by" in pred_norm:
@@ -186,7 +188,9 @@ def analyze_single_failure(
             gold_cols = len(gold_result[0]) if isinstance(gold_result[0], tuple) else 1
             pred_cols = len(pred_result[0]) if isinstance(pred_result[0], tuple) else 1
             if gold_cols != pred_cols:
-                details["pattern"] = f"Column count mismatch: gold={gold_cols}, pred={pred_cols}"
+                details["pattern"] = (
+                    f"Column count mismatch: gold={gold_cols}, pred={pred_cols}"
+                )
 
     return FailureAnalysis(
         index=example["index"],
@@ -251,10 +255,10 @@ def generate_report(analyses: list[FailureAnalysis], output_path: Path) -> str:
         if a.details.get("evidence"):
             lines.append(f"Evidence: {a.details['evidence']}")
             lines.append("")
-        lines.append(f"Gold SQL:")
+        lines.append("Gold SQL:")
         lines.append(f"  {a.gold_sql}")
         lines.append("")
-        lines.append(f"Predicted SQL:")
+        lines.append("Predicted SQL:")
         lines.append(f"  {a.predicted_sql}")
         lines.append("")
 
@@ -281,10 +285,21 @@ def generate_report(analyses: list[FailureAnalysis], output_path: Path) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze EGTTS failures")
-    parser.add_argument("--results", type=str, required=True, help="Path to results JSON")
-    parser.add_argument("--limit", type=int, default=10, help="Number of failures to analyze")
-    parser.add_argument("--data-dir", type=str, default="data/bird", help="Path to BIRD data")
-    parser.add_argument("--output", type=str, default="results/failure_report.txt", help="Output report path")
+    parser.add_argument(
+        "--results", type=str, required=True, help="Path to results JSON"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=10, help="Number of failures to analyze"
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default="data/bird", help="Path to BIRD data"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results/failure_report.txt",
+        help="Output report path",
+    )
     args = parser.parse_args()
 
     # Load results
@@ -305,7 +320,7 @@ def main():
         sys.exit(0)
 
     # Limit
-    failures = failures[:args.limit]
+    failures = failures[: args.limit]
     print(f"Analyzing first {len(failures)} failures...")
 
     # Find database paths
@@ -330,7 +345,7 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    report = generate_report(analyses, output_path)
+    generate_report(analyses, output_path)
 
     print(f"\nReport saved to: {output_path}")
     print("\n" + "=" * 60)

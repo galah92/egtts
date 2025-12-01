@@ -1,11 +1,15 @@
 """Dataset loading utilities for Spider and BIRD benchmarks."""
 
+from __future__ import annotations
+
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from datasets import load_dataset
+if TYPE_CHECKING:
+    from datasets import Dataset
 
 
-def load_spider(split: str = "validation", cache_dir: str | None = None):
+def load_spider(split: str = "validation", cache_dir: str | None = None) -> Dataset:
     """
     Load Spider dataset from HuggingFace.
 
@@ -22,12 +26,9 @@ def load_spider(split: str = "validation", cache_dir: str | None = None):
     Returns:
         HuggingFace Dataset object with Spider examples
     """
-    dataset = load_dataset(
-        "spider",
-        split=split,
-        cache_dir=cache_dir
-    )
-    return dataset
+    from datasets import load_dataset
+
+    return load_dataset("spider", split=split, cache_dir=cache_dir)  # type: ignore[return-value]
 
 
 def get_database_path(db_id: str, spider_dir: Path) -> Path:
@@ -42,6 +43,9 @@ def get_database_path(db_id: str, spider_dir: Path) -> Path:
 
     Returns:
         Path to the SQLite database file
+
+    Raises:
+        FileNotFoundError: If the database file doesn't exist
     """
     db_path = spider_dir / "database" / db_id / f"{db_id}.sqlite"
 

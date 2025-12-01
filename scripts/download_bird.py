@@ -22,14 +22,12 @@ def download_bird():
 
     # Access SQLite version
     sqlite_data = dataset["mini_dev_sqlite"]
-    print(f"✓ Loaded {len(sqlite_data)} SQLite instances")
+    data_list = list(sqlite_data)
+    print(f"✓ Loaded {len(data_list)} SQLite instances")
 
     # Save to local JSON for inspection
     output_dir = Path("data/bird_data")
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Convert to list of dicts
-    data_list = list(sqlite_data)
 
     output_file = output_dir / "mini_dev_sqlite.json"
     with open(output_file, "w") as f:
@@ -60,20 +58,20 @@ def download_bird():
     print("=" * 80)
 
     # Count difficulty levels if available
-    if 'difficulty' in example:
+    if "difficulty" in example:
         difficulties = {}
         for item in data_list:
-            diff = item.get('difficulty', 'unknown')
+            diff = item.get("difficulty", "unknown")
             difficulties[diff] = difficulties.get(diff, 0) + 1
 
         print("\nDifficulty Distribution:")
         for diff, count in difficulties.items():
-            print(f"  {diff}: {count} ({count/len(data_list)*100:.1f}%)")
+            print(f"  {diff}: {count} ({count / len(data_list) * 100:.1f}%)")
 
     # Count databases
     db_ids = {}
     for item in data_list:
-        db_id = item.get('db_id', 'unknown')
+        db_id = item.get("db_id", "unknown")
         db_ids[db_id] = db_ids.get(db_id, 0) + 1
 
     print(f"\nUnique Databases: {len(db_ids)}")

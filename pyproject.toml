@@ -20,7 +20,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff>=0.14.5",
-    "ty>=0.0.1a27",
+    "ty>=0.0.1a29",
 ]
 
 [build-system]
@@ -30,10 +30,3 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["egtts*"]
-
-[tool.ruff]
-exclude = ["data", "results", ".venv"]
-line-length = 120
-
-[tool.ruff.lint]
-select = ["E", "F", "I"]  # pycodestyle errors, pyflakes, isort

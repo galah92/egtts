@@ -24,7 +24,7 @@ def format_predictions():
     print(f"✓ Loaded {len(examples)} examples and {len(predictions)} predictions")
 
     if len(examples) != len(predictions):
-        print(f"⚠ Warning: Mismatch in counts!")
+        print("⚠ Warning: Mismatch in counts!")
         return
 
     # Write predictions in format: SQL\tDB_ID

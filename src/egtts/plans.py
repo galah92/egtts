@@ -8,11 +8,25 @@ By comparing plans instead of SQL strings, we can group semantically
 equivalent queries for majority voting.
 """
 
+from __future__ import annotations
+
 import re
+import sqlite3
 from collections import Counter
+from typing import Any
+
+from .database import ExplainSuccess, PlanRow
 
 
-def normalize_plan(explain_output: list[dict]) -> str:
+# VoteStats is a dict with flexible keys for different strategies
+VoteStats = dict[str, Any]
+
+
+# Type alias for candidate tuple: (sql, signature, cost)
+Candidate = tuple[str, str, int]
+
+
+def normalize_plan(explain_output: list[PlanRow]) -> str:
     """
     Normalize EXPLAIN QUERY PLAN output into a hashable signature.
 
@@ -34,7 +48,7 @@ def normalize_plan(explain_output: list[dict]) -> str:
     if not explain_output:
         return ""
 
-    signature_parts = []
+    signature_parts: list[str] = []
 
     for row in explain_output:
         detail = row.get("detail", "")
@@ -121,8 +135,8 @@ def _normalize_detail(detail: str) -> str:
 
     # If we don't recognize it, return a simplified version
     # Remove numbers and specific identifiers
-    simplified = re.sub(r'\d+', '', detail)
-    simplified = re.sub(r'\s+', '_', simplified.strip())
+    simplified = re.sub(r"\d+", "", detail)
+    simplified = re.sub(r"\s+", "_", simplified.strip())
     return simplified[:50] if simplified else ""
 
 
@@ -137,7 +151,7 @@ def get_plan_signature(sql: str, db_path: str) -> tuple[str, int]:
     Returns:
         Tuple of (signature, cost) or ("ERROR", -1) if query is invalid
     """
-    from .database import explain_query, ExplainSuccess
+    from .database import explain_query
 
     result = explain_query(sql, db_path)
 
@@ -150,7 +164,7 @@ def get_plan_signature(sql: str, db_path: str) -> tuple[str, int]:
     return signature, cost
 
 
-def _calculate_cost(plan: list[dict]) -> int:
+def _calculate_cost(plan: list[PlanRow]) -> int:
     """Calculate heuristic cost from plan (lower is better)."""
     cost = 0
     plan_str = " ".join(str(row) for row in plan).upper()
@@ -159,14 +173,14 @@ def _calculate_cost(plan: list[dict]) -> int:
     if "SCAN " in plan_str and "USING INDEX" not in plan_str:
         cost += 100  # Full table scan
     if "USE TEMP B-TREE" in plan_str:
-        cost += 50   # Temp structure overhead
+        cost += 50  # Temp structure overhead
     if "CORRELATED" in plan_str:
-        cost += 75   # Correlated subquery (expensive)
+        cost += 75  # Correlated subquery (expensive)
 
     return cost
 
 
-def vote_by_plan(candidates: list[tuple[str, str, int]]) -> tuple[str, str, dict]:
+def vote_by_plan(candidates: list[Candidate]) -> tuple[str, str, VoteStats]:
     """
     Perform majority voting based on plan signatures.
 
@@ -177,28 +191,32 @@ def vote_by_plan(candidates: list[tuple[str, str, int]]) -> tuple[str, str, dict
         Tuple of (winning_sql, winning_signature, vote_stats)
     """
     # Filter out errors
-    valid = [(sql, sig, cost) for sql, sig, cost in candidates if sig != "ERROR"]
+    valid: list[Candidate] = [
+        (sql, sig, cost) for sql, sig, cost in candidates if sig != "ERROR"
+    ]
 
     if not valid:
         # All failed - return first candidate
         if candidates:
-            return candidates[0][0], "ERROR", {"error": "all_invalid"}
-        return "", "ERROR", {"error": "no_candidates"}
+            return candidates[0][0], "ERROR", VoteStats(error="all_invalid")
+        return "", "ERROR", VoteStats(error="no_candidates")
 
     # Count votes by signature
-    signature_counts = Counter(sig for _, sig, _ in valid)
+    signature_counts: Counter[str] = Counter(sig for _, sig, _ in valid)
 
     # Find winning signature
     winning_sig, vote_count = signature_counts.most_common(1)[0]
 
     # Get all candidates matching winning signature
-    winners = [(sql, sig, cost) for sql, sig, cost in valid if sig == winning_sig]
+    winners: list[Candidate] = [
+        (sql, sig, cost) for sql, sig, cost in valid if sig == winning_sig
+    ]
 
     # Tie-breaker: pick lowest cost among winners
     winners.sort(key=lambda x: x[2])
     best_sql = winners[0][0]
 
-    vote_stats = {
+    vote_stats: VoteStats = {
         "total_candidates": len(candidates),
         "valid_candidates": len(valid),
         "unique_signatures": len(signature_counts),
@@ -210,7 +228,7 @@ def vote_by_plan(candidates: list[tuple[str, str, int]]) -> tuple[str, str, dict
     return best_sql, winning_sig, vote_stats
 
 
-def extract_string_literals(sql: str) -> list[tuple[str, str]]:
+def extract_string_literals(sql: str) -> list[tuple[str, str | None]]:
     """
     Extract string literals and their likely column context from SQL.
 
@@ -224,13 +242,13 @@ def extract_string_literals(sql: str) -> list[tuple[str, str]]:
     """
     # Pattern: word = 'value' or word LIKE 'value'
     pattern = r"(\w+)\s*(?:=|LIKE|IN\s*\()\s*'([^']+)'"
-    matches = re.findall(pattern, sql, re.IGNORECASE)
+    matches: list[tuple[str, str]] = re.findall(pattern, sql, re.IGNORECASE)
 
     # Also catch standalone literals without clear column context
-    all_literals = re.findall(r"'([^']+)'", sql)
+    all_literals: list[str] = re.findall(r"'([^']+)'", sql)
 
-    results = []
-    matched_values = set(m[1] for m in matches)
+    results: list[tuple[str, str | None]] = []
+    matched_values: set[str] = {m[1] for m in matches}
 
     for col, val in matches:
         results.append((val, col))
@@ -256,15 +274,12 @@ def probe_literal(db_path: str, table: str, column: str, value: str) -> bool:
     Returns:
         True if value exists, False otherwise
     """
-    import sqlite3
-
     try:
         conn = sqlite3.connect(db_path, timeout=1.0)
         cursor = conn.cursor()
         # Quick existence check with LIMIT 1
         cursor.execute(
-            f"SELECT 1 FROM `{table}` WHERE `{column}` = ? LIMIT 1",
-            (value,)
+            f"SELECT 1 FROM `{table}` WHERE `{column}` = ? LIMIT 1", (value,)
         )
         result = cursor.fetchone()
         conn.close()
@@ -280,18 +295,16 @@ def get_schema_columns(db_path: str) -> dict[str, list[str]]:
     Returns:
         Dict mapping table_name -> list of column_names
     """
-    import sqlite3
-
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [row[0] for row in cursor.fetchall()]
+    tables: list[str] = [row[0] for row in cursor.fetchall()]
 
-    schema = {}
+    schema: dict[str, list[str]] = {}
     for table in tables:
         cursor.execute(f"PRAGMA table_info(`{table}`)")
-        columns = [row[1] for row in cursor.fetchall()]
+        columns: list[str] = [row[1] for row in cursor.fetchall()]
         schema[table] = columns
 
     conn.close()
@@ -322,11 +335,11 @@ def probe_sql_literals(sql: str, db_path: str) -> tuple[int, int, list[str]]:
 
     probes_passed = 0
     probes_total = 0
-    failed_probes = []
+    failed_probes: list[str] = []
 
     for value, hint_column in literals:
         # Skip obvious non-data literals (dates, wildcards, etc.)
-        if '%' in value or value.isdigit():
+        if "%" in value or value.isdigit():
             continue
 
         probed = False
@@ -356,9 +369,8 @@ def probe_sql_literals(sql: str, db_path: str) -> tuple[int, int, list[str]]:
 
 
 def vote_by_plan_with_probing(
-    candidates: list[tuple[str, str, int]],
-    db_path: str
-) -> tuple[str, str, dict]:
+    candidates: list[Candidate], db_path: str
+) -> tuple[str, str, VoteStats]:
     """
     Perform majority voting with Data Probing as tie-breaker (M13).
 
@@ -375,28 +387,31 @@ def vote_by_plan_with_probing(
         Tuple of (winning_sql, winning_signature, vote_stats)
     """
     # Filter out errors and special signatures
-    valid = [
-        (sql, sig, cost) for sql, sig, cost in candidates
+    valid: list[Candidate] = [
+        (sql, sig, cost)
+        for sql, sig, cost in candidates
         if sig not in ("ERROR", "FILTERED_CHATTY")
     ]
 
     if not valid:
         if candidates:
-            return candidates[0][0], "ERROR", {"error": "all_invalid"}
-        return "", "ERROR", {"error": "no_candidates"}
+            return candidates[0][0], "ERROR", VoteStats(error="all_invalid")
+        return "", "ERROR", VoteStats(error="no_candidates")
 
     # Count votes by signature
-    signature_counts = Counter(sig for _, sig, _ in valid)
+    signature_counts: Counter[str] = Counter(sig for _, sig, _ in valid)
 
     # Get top clusters (those with significant votes)
-    top_clusters = signature_counts.most_common(3)  # Top 3
+    top_clusters: list[tuple[str, int]] = signature_counts.most_common(3)
 
     # For each cluster, compute probe score
-    cluster_scores = []
-    probing_stats = {}
+    cluster_scores: list[tuple[str, float, int, str]] = []
+    probing_stats: dict[str, dict[str, Any]] = {}
 
     for sig, vote_count in top_clusters:
-        cluster_candidates = [(sql, cost) for sql, s, cost in valid if s == sig]
+        cluster_candidates: list[tuple[str, int]] = [
+            (sql, cost) for sql, s, cost in valid if s == sig
+        ]
 
         # Probe the best (lowest cost) candidate from each cluster
         cluster_candidates.sort(key=lambda x: x[1])
@@ -427,7 +442,7 @@ def vote_by_plan_with_probing(
     winning_sql = cluster_scores[0][3]
     winning_votes = cluster_scores[0][2]
 
-    vote_stats = {
+    vote_stats: VoteStats = {
         "total_candidates": len(candidates),
         "valid_candidates": len(valid),
         "unique_signatures": len(signature_counts),
