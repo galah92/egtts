@@ -158,13 +158,13 @@ egtts/
 
 | Model | Params | Strategy | Accuracy | Time/Example | Notes |
 |-------|--------|----------|----------|--------------|-------|
-| **Arctic-Text2SQL-7B** | 7B | **M10** | **60.0%** | ~49s | Fine-tuned + inference scaling |
-| Arctic-Text2SQL-7B | 7B | Baseline | 54.0% | ~30s | Fine-tuned only |
+| **Arctic-Text2SQL-7B** | 7B | **Baseline** | **60.0%** | ~29s | OmniSQL prompt format |
+| Arctic-Text2SQL-7B | 7B | Baseline (old) | 54.0% | ~30s | Generic prompt format |
 | Qwen2.5-Coder-7B | 7B | M10 | 53.6% | ~14s | Inference scaling only |
 | Qwen3-4B | 4B | M10 | 49.2% | ~10s | -4.4 points |
 | Qwen2.5-Coder-7B | 7B | Baseline | 41.6% | ~5s | No enhancements |
 
-**Conclusion**: Arctic + M10 achieves the best accuracy (60.0%) by combining fine-tuning with inference-time scaling. For cost-efficiency, Qwen2.5-Coder-7B + M10 (53.6%) is a strong zero-training alternative.
+**Conclusion**: Using the correct OmniSQL prompt format improves Arctic baseline from 54% → 60% (+6 points). The remaining gap to Arctic's reported 68.9% is likely due to their **value retrieval** technique (extracting literal values from the database).
 
 ## Metrics
 
@@ -238,31 +238,40 @@ then **Arctic + M10 could potentially reach ~75-80%**, approaching the current o
 | ✅ Baseline | Qwen2.5-Coder-7B | Greedy | 41.6% | Baseline |
 | ✅ M10 | Qwen2.5-Coder-7B | Plan Voting | **53.6%** | +12 points |
 | ✅ M10 | Qwen3-4B | Plan Voting | 49.2% | Smaller model, lower accuracy |
-| ✅ Baseline | Arctic-Text2SQL-7B | Greedy | 54.0% | Proper prompts |
-| ✅ M10 | Arctic-Text2SQL-7B | Plan Voting | **60.0%** | **+6 points with proper prompts** |
+| ✅ Baseline | Arctic-Text2SQL-7B | Greedy (old) | 54.0% | Generic prompts |
+| ✅ Baseline | Arctic-Text2SQL-7B | Greedy (OmniSQL) | **60.0%** | +6 points with proper format |
+| 🔄 M10 | Arctic-Text2SQL-7B | Plan Voting | *pending* | Expected: ~65%+ |
 
-**Key Finding: Inference-time scaling stacks with fine-tuning!**
+**Key Finding: Prompt format is critical for fine-tuned models!**
 
-### Key Finding: Prompt Format Matters
+### Key Finding: OmniSQL Prompt Format
 
-**Arctic-Text2SQL failed with our M10 strategy** (38.0% vs expected ~75-80%) due to prompt format mismatch.
+Arctic-Text2SQL was trained using the **OmniSQL prompt format**:
+- Single user message (no system message)
+- "Task Overview: You are a data science expert..."
+- "Database Engine: SQLite" specification
+- "Take a deep breath and think step by step" instruction
+- Chain-of-thought in `<think>` tags, SQL in `<answer>` tags
 
-Arctic was trained with a specific format:
-- System prompt: "You are a data science expert..."
-- Chain-of-thought in `<think>` tags (4K tokens)
-- SQL output in `<answer>` tags with markdown code blocks
-- Explicit "Database Engine: SQLite" specification
+Using the correct format improved baseline from **54% → 60%** (+6 points).
 
-Our generic prompt ("Generate a SQL query...") confused the model, causing it to output reasoning text instead of SQL.
+The remaining ~9 point gap to Arctic's reported 68.9% is likely due to their **value retrieval** technique, which extracts literal values from the database to help with case sensitivity and date formats.
 
-**Lesson learned**: Inference-time scaling cannot be blindly applied to fine-tuned models. You must respect the model's training prompt format.
+### Common Failure Patterns
+
+Analysis of failures shows:
+1. **Date format**: Model uses `SUBSTR(Date, 6, 2)` but data is `YYYYMM` format (month at position 5)
+2. **Case sensitivity**: Model uses `'discount'` but actual value is `'Discount'`
+3. **Extra columns**: Model adds computed columns not requested
+
+These are exactly the issues **value retrieval** would fix.
 
 ### Future Work
 
-To properly test the stacking hypothesis:
-1. Adapt prompt generation to match Arctic's expected format
-2. Parse SQL from `<answer>` tags containing markdown code blocks
-3. Handle chain-of-thought prefix during voting
+1. ✅ Implement OmniSQL prompt format - **Done, +6 points**
+2. 🔄 Test Arctic + M10 with new prompt format
+3. ⏳ Implement value retrieval technique
+4. ⏳ Run on full Dev set (1,534 examples)
 
 ### Paper Contribution
 
