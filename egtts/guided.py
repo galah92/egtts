@@ -12,7 +12,12 @@ import sqlglot
 from sqlglot import exp
 
 from .database import ExplainSuccess, PlanRow, explain_query
-from .model import create_sql_prompt, generate_sql
+from .model import (
+    create_arctic_prompt,
+    create_sql_prompt,
+    extract_sql_from_arctic_response,
+    generate_sql,
+)
 from .schema import SchemaIndex, build_schema_index, get_augmented_schema
 
 if TYPE_CHECKING:
@@ -56,10 +61,12 @@ class ExplainGuidedGenerator:
         model: PreTrainedModel,
         tokenizer: Tokenizer,
         max_iterations: int = 3,
+        is_arctic: bool = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.max_iterations = max_iterations
+        self.is_arctic = is_arctic
 
     def generate(self, question: str, schema: str) -> str:
         """Generate SQL query (greedy decoding)."""
@@ -105,32 +112,37 @@ class ExplainGuidedGenerator:
         candidates = []
         for output in outputs:
             generated_ids = output[input_length:]
-            sql = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            raw_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-            # Clean up SQL
-            if "```sql" in sql.lower():
-                sql = sql.split("```sql", 1)[1].split("```")[0].strip()
-            elif "```" in sql:
-                parts = sql.split("```")
-                if len(parts) >= 2:
-                    sql = parts[1].strip()
+            # Use Arctic-specific extraction if needed
+            if self.is_arctic:
+                sql = extract_sql_from_arctic_response(raw_text)
+            else:
+                sql = raw_text
+                # Clean up SQL
+                if "```sql" in sql.lower():
+                    sql = sql.split("```sql", 1)[1].split("```")[0].strip()
+                elif "```" in sql:
+                    parts = sql.split("```")
+                    if len(parts) >= 2:
+                        sql = parts[1].strip()
 
-            lines = sql.split("\n")
-            sql_lines = []
-            for line in lines:
-                line = line.strip()
-                if (
-                    line
-                    and not line.startswith("--")
-                    and not line.lower().startswith(
-                        ("this query", "the query", "note:")
-                    )
-                ):
-                    sql_lines.append(line)
-                elif sql_lines:
-                    break
+                lines = sql.split("\n")
+                sql_lines = []
+                for line in lines:
+                    line = line.strip()
+                    if (
+                        line
+                        and not line.startswith("--")
+                        and not line.lower().startswith(
+                            ("this query", "the query", "note:")
+                        )
+                    ):
+                        sql_lines.append(line)
+                    elif sql_lines:
+                        break
 
-            sql = " ".join(sql_lines).strip()
+                sql = " ".join(sql_lines).strip()
             candidates.append(sql)
 
         return candidates
@@ -144,12 +156,14 @@ class ExplainGuidedGenerator:
     ) -> tuple[list[str], float]:
         """Generate diverse SQL samples with OOM-safe batching."""
         gen_start = time.perf_counter()
+        # Arctic needs more tokens for <think> + <answer> format
+        max_tokens = 2048 if self.is_arctic else 256
 
         try:
             with torch.no_grad():
                 outputs = self.model.generate(  # type: ignore[operator]
                     **inputs,
-                    max_new_tokens=256,
+                    max_new_tokens=max_tokens,
                     do_sample=True,
                     temperature=temperature,
                     num_return_sequences=num_samples,
@@ -162,27 +176,31 @@ class ExplainGuidedGenerator:
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 torch.cuda.empty_cache()
-                # Fallback: generate in two batches
-                half = num_samples // 2
-                all_outputs = []
+                # Fallback: generate in smaller batches
+                batch_size = max(1, num_samples // 3)  # Split into 3 batches
+                all_candidates = []
 
-                for batch_size in [half, num_samples - half]:
+                remaining = num_samples
+                while remaining > 0:
+                    current_batch = min(batch_size, remaining)
                     with torch.no_grad():
                         outputs = self.model.generate(  # type: ignore[operator]
                             **inputs,
-                            max_new_tokens=256,
+                            max_new_tokens=max_tokens,
                             do_sample=True,
                             temperature=temperature,
-                            num_return_sequences=batch_size,
+                            num_return_sequences=current_batch,
                             pad_token_id=self.tokenizer.eos_token_id,
                             eos_token_id=self.tokenizer.eos_token_id,
                         )
-                    all_outputs.extend(outputs)
+                    # Decode each batch individually to avoid torch.stack issues
+                    batch_candidates = self._decode_candidates(outputs, input_length)
+                    all_candidates.extend(batch_candidates)
+                    remaining -= current_batch
+                    torch.cuda.empty_cache()
 
                 gen_time = (time.perf_counter() - gen_start) * 1000
-                return self._decode_candidates(
-                    torch.stack(all_outputs), input_length
-                ), gen_time
+                return all_candidates, gen_time
             raise
 
     # =========================================================================
@@ -393,7 +411,13 @@ class ExplainGuidedGenerator:
         augmented_schema = get_augmented_schema(db_path, max_rows_per_table=3)
         schema_time = (time.perf_counter() - schema_start) * 1000
 
-        prompt = create_sql_prompt(question, augmented_schema, self.tokenizer)
+        # Use Arctic-specific prompt format if needed
+        if self.is_arctic:
+            prompt = create_arctic_prompt(question, augmented_schema, self.tokenizer)
+            # Reduce samples for Arctic due to memory constraints (2048 tokens per sample)
+            num_samples = min(num_samples, 8)
+        else:
+            prompt = create_sql_prompt(question, augmented_schema, self.tokenizer)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         input_length = inputs["input_ids"].shape[1]
 

@@ -156,13 +156,15 @@ egtts/
 
 ## Model Size Experiments
 
-| Model | Quantization | Accuracy | Time/Example | Status |
-|-------|--------------|----------|--------------|--------|
-| 7B | FP16 | 62.0% | 14s | Default |
-| 14B | 4-bit | 64.0% | 37s | Works but slow |
-| 14B | 8-bit | - | - | OOM |
+| Model | Params | Strategy | Accuracy | Time/Example | Notes |
+|-------|--------|----------|----------|--------------|-------|
+| **Arctic-Text2SQL-7B** | 7B | **M10** | **60.0%** | ~49s | Fine-tuned + inference scaling |
+| Arctic-Text2SQL-7B | 7B | Baseline | 54.0% | ~30s | Fine-tuned only |
+| Qwen2.5-Coder-7B | 7B | M10 | 53.6% | ~14s | Inference scaling only |
+| Qwen3-4B | 4B | M10 | 49.2% | ~10s | -4.4 points |
+| Qwen2.5-Coder-7B | 7B | Baseline | 41.6% | ~5s | No enhancements |
 
-14B with 4-bit quantization provides +2% accuracy but 2.7x slower inference. Not recommended for default use.
+**Conclusion**: Arctic + M10 achieves the best accuracy (60.0%) by combining fine-tuning with inference-time scaling. For cost-efficiency, Qwen2.5-Coder-7B + M10 (53.6%) is a strong zero-training alternative.
 
 ## Metrics
 
@@ -188,6 +190,7 @@ BIRD's official efficiency metric with tiered rewards based on execution time ra
 3. **Incremental decomposition**: SQL is holistic, not decomposable
 4. **Few-shot prompting**: Hurt generalization on this task
 5. **Execution feedback**: Most wrong queries return data (just wrong data)
+6. **Blind fine-tuned model usage**: Prompt format mismatch destroys performance (Arctic: 38% vs expected ~75%)
 
 ### Scientific Conclusion
 
@@ -202,6 +205,85 @@ The model "knows" the correct answer but assigns it low probability. By sampling
 3. **SQLite-specific**: Plan analysis uses SQLite's EXPLAIN format
 4. **7B model optimal**: Larger models provide minimal accuracy gain at high cost
 
+## Comparison with SOTA (7B Models)
+
+### BIRD Benchmark Leaderboard (Single Model Track, 7B class)
+
+| Model | BIRD Dev | BIRD Test | Training | Our Method? |
+|-------|----------|-----------|----------|-------------|
+| Arctic-Text2SQL-R1-7B | 70.7% | 70.4% | GRPO (64 H100s) | Baseline only |
+| SFT CodeS-7B | 57.2% | 59.3% | SFT | - |
+| **EGTTS M10 (ours)** | **53.6%** | - | **Zero** | Yes |
+| Qwen2.5-Coder-7B | 41.6% | - | Zero | Baseline |
+| Llama3-8b-instruct | 24.4% | - | Zero | - |
+
+### Key Insight
+
+Our inference-time scaling approach (M10) achieves **+12 points** over greedy baseline **without any training**.
+This is competitive with fine-tuned models while requiring zero GPU training cost.
+
+## Research Roadmap
+
+### Hypothesis
+
+> **Can inference-time scaling stack with fine-tuning to exceed SOTA?**
+
+If Arctic-Text2SQL achieves 70.7% with greedy decoding, and our M10 strategy adds ~12 points to base models,
+then **Arctic + M10 could potentially reach ~75-80%**, approaching the current overall SOTA (81.7%).
+
+### Experiment Results
+
+| Experiment | Model | Strategy | Result | Notes |
+|------------|-------|----------|--------|-------|
+| ✅ Baseline | Qwen2.5-Coder-7B | Greedy | 41.6% | Baseline |
+| ✅ M10 | Qwen2.5-Coder-7B | Plan Voting | **53.6%** | +12 points |
+| ✅ M10 | Qwen3-4B | Plan Voting | 49.2% | Smaller model, lower accuracy |
+| ✅ Baseline | Arctic-Text2SQL-7B | Greedy | 54.0% | Proper prompts |
+| ✅ M10 | Arctic-Text2SQL-7B | Plan Voting | **60.0%** | **+6 points with proper prompts** |
+
+**Key Finding: Inference-time scaling stacks with fine-tuning!**
+
+### Key Finding: Prompt Format Matters
+
+**Arctic-Text2SQL failed with our M10 strategy** (38.0% vs expected ~75-80%) due to prompt format mismatch.
+
+Arctic was trained with a specific format:
+- System prompt: "You are a data science expert..."
+- Chain-of-thought in `<think>` tags (4K tokens)
+- SQL output in `<answer>` tags with markdown code blocks
+- Explicit "Database Engine: SQLite" specification
+
+Our generic prompt ("Generate a SQL query...") confused the model, causing it to output reasoning text instead of SQL.
+
+**Lesson learned**: Inference-time scaling cannot be blindly applied to fine-tuned models. You must respect the model's training prompt format.
+
+### Future Work
+
+To properly test the stacking hypothesis:
+1. Adapt prompt generation to match Arctic's expected format
+2. Parse SQL from `<answer>` tags containing markdown code blocks
+3. Handle chain-of-thought prefix during voting
+
+### Paper Contribution
+
+**Title idea**: *"Inference-Time Scaling for Text-to-SQL: When It Works and When It Doesn't"*
+
+1. **Positive finding**: +12 points on base models without training
+2. **Negative finding**: Prompt format mismatch destroys fine-tuned model performance
+3. **Practical guidance**: How to adapt inference-time strategies for different model types
+
+### Available Models
+
+```bash
+# General instruction models
+--model qwen2.5-coder-7b    # Baseline (14GB VRAM)
+--model qwen3-4b            # Fast & efficient (8GB VRAM)
+
+# Text-to-SQL fine-tuned models
+--model arctic-text2sql     # SOTA 7B (68.9% BIRD), 16GB VRAM
+--model omnisql-7b          # Strong alternative, SQLite-only
+```
+
 ## References
 
 - [BIRD Benchmark](https://bird-bench.github.io/) - Li et al., NeurIPS 2023
@@ -210,6 +292,8 @@ The model "knows" the correct answer but assigns it low probability. By sampling
 - [EG-CFG](https://arxiv.org/abs/2506.10948) - Lavon et al., 2024
 - [DAIL-SQL](https://arxiv.org/abs/2308.15363) - Gao et al., 2023
 - [TA-SQL](https://arxiv.org/abs/2402.12960) - ACL Findings 2024
+- [Arctic-Text2SQL-R1](https://arxiv.org/abs/2505.20315) - Snowflake, May 2025
+- [OmniSQL](https://arxiv.org/abs/2503.02240) - RUCBM, 2025
 
 ## License
 

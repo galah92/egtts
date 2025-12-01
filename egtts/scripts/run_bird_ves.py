@@ -25,9 +25,9 @@ from typing import Any, TypedDict
 
 from tqdm import tqdm
 
-from egtts import load_model
+from egtts import MODEL_PRESETS, load_model
 from egtts.guided import ExplainGuidedGenerator
-from egtts.model import create_sql_prompt, generate_sql
+from egtts.model import create_arctic_prompt, create_sql_prompt, generate_sql, is_arctic_model
 
 
 class BenchmarkResults(TypedDict):
@@ -122,19 +122,29 @@ def calculate_ves(
 
 
 def run_baseline(
-    generator: ExplainGuidedGenerator, question: str, schema: str, evidence: str
+    generator: ExplainGuidedGenerator, question: str, schema: str, evidence: str,
+    use_arctic: bool = False,
 ) -> tuple[str, dict]:
     """Baseline: Greedy decoding."""
     start_time = time.perf_counter()
-    prompt = create_sql_prompt(
-        question, schema, generator.tokenizer, evidence=evidence if evidence else None
-    )
+
+    # Use Arctic-specific prompt format if needed
+    if use_arctic:
+        prompt = create_arctic_prompt(
+            question, schema, generator.tokenizer, evidence=evidence if evidence else None
+        )
+    else:
+        prompt = create_sql_prompt(
+            question, schema, generator.tokenizer, evidence=evidence if evidence else None
+        )
+
     sql = generate_sql(
         generator.model,
         generator.tokenizer,
         prompt,
         max_new_tokens=512,
         do_sample=False,
+        is_arctic=use_arctic,
     )
     return sql, {
         "strategy": "baseline",
@@ -295,7 +305,13 @@ def run_benchmark(
     """Run the VES benchmark."""
     # Load model
     model, tokenizer = load_model(model_name, quantization=quantization)
-    generator = ExplainGuidedGenerator(model, tokenizer)
+
+    # Check if this is an Arctic model (requires special prompt format)
+    use_arctic = is_arctic_model(model_name)
+    if use_arctic:
+        print("Detected Arctic model - using Arctic-specific prompt format")
+
+    generator = ExplainGuidedGenerator(model, tokenizer, is_arctic=use_arctic)
 
     # Load dataset
     data = load_bird_mini_dev(data_dir)
@@ -336,7 +352,7 @@ def run_benchmark(
 
         # Generate prediction based on strategy
         if strategy == "baseline":
-            pred_sql, metadata = run_baseline(generator, question, schema, evidence)
+            pred_sql, metadata = run_baseline(generator, question, schema, evidence, use_arctic=use_arctic)
         elif strategy == "M4":
             pred_sql, metadata = run_m4(generator, question, schema, evidence, db_path)
         elif strategy == "M7":
@@ -383,6 +399,9 @@ def run_benchmark(
     accuracy = correct / total if total > 0 else 0.0
     avg_ves = total_ves / total if total > 0 else 0.0
 
+    # Create short model name for filenames
+    model_short = model_name.split("/")[-1].lower().replace("-instruct", "")
+
     results: BenchmarkResults = {
         "strategy": strategy,
         "total": total,
@@ -397,7 +416,7 @@ def run_benchmark(
 
     # Save results
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"bird_ves_{strategy}_{total}.json"
+    output_file = output_dir / f"bird_ves_{model_short}_{strategy}_{total}.json"
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -433,11 +452,14 @@ def main():
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of examples"
     )
+    preset_help = "Model preset or HuggingFace path. Presets:\n" + "\n".join(
+        f"  {k}: {v}" for k, v in MODEL_PRESETS.items()
+    )
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-Coder-7B-Instruct",
-        help="Model to use",
+        default="qwen2.5-coder-7b",
+        help=preset_help,
     )
     parser.add_argument(
         "--quantization",
