@@ -1,10 +1,17 @@
 # EGTTS: Execution-Guided Text-to-SQL
 
-A research project exploring inference-time scaling for Text-to-SQL. We achieve **53.6% accuracy** on BIRD Mini-Dev (up from 41.6% baseline) using schema augmentation with plan-based majority voting.
+A research project exploring **inference-time scaling** for Text-to-SQL. We achieve **+12 points accuracy** on BIRD Mini-Dev (41.6% → 53.6%) using plan-based majority voting—without any training.
 
-- **Model**: Qwen2.5-Coder-7B-Instruct
-- **Best Strategy**: M10 (Schema Augmentation + Plan Voting)
-- **Dataset**: BIRD Mini-Dev (500 examples)
+**Current focus**: Extending plan consensus to [BIRD-Interact](https://bird-interact.github.io/) for multi-turn ambiguity resolution.
+
+| Phase | Dataset | Result | Status |
+|-------|---------|--------|--------|
+| 1. Single-turn | BIRD Mini-Dev | **53.6%** (+12 pts) | ✅ Complete |
+| 2. Interactive | BIRD-Interact | TBD | 🔄 In Progress |
+
+- **Core Insight**: "Hallucinations are fragile, correct answers are stable"
+- **Method**: Generate multiple candidates → cluster by execution plan → vote for largest cluster
+- **No training required**: Pure inference-time scaling
 
 ## Core Insight
 
@@ -224,62 +231,107 @@ This is competitive with fine-tuned models while requiring zero GPU training cos
 
 ## Research Roadmap
 
-### Hypothesis
+### Phase 1: Single-Turn Text-to-SQL (Completed)
 
-> **Can inference-time scaling stack with fine-tuning to exceed SOTA?**
-
-If Arctic-Text2SQL achieves 70.7% with greedy decoding, and our M10 strategy adds ~12 points to base models,
-then **Arctic + M10 could potentially reach ~75-80%**, approaching the current overall SOTA (81.7%).
-
-### Experiment Results
+> **Finding**: Inference-time scaling achieves +12 points without training on classic BIRD.
 
 | Experiment | Model | Strategy | Result | Notes |
 |------------|-------|----------|--------|-------|
 | ✅ Baseline | Qwen2.5-Coder-7B | Greedy | 41.6% | Baseline |
 | ✅ M10 | Qwen2.5-Coder-7B | Plan Voting | **53.6%** | +12 points |
-| ✅ M10 | Qwen3-4B | Plan Voting | 49.2% | Smaller model, lower accuracy |
-| ✅ Baseline | Arctic-Text2SQL-7B | Greedy (old) | 54.0% | Generic prompts |
+| ✅ M10 | Qwen3-4B | Plan Voting | 49.2% | Smaller model |
 | ✅ Baseline | Arctic-Text2SQL-7B | Greedy (OmniSQL) | **60.0%** | +6 points with proper format |
-| 🔄 M10 | Arctic-Text2SQL-7B | Plan Voting | *pending* | Expected: ~65%+ |
 
-**Key Finding: Prompt format is critical for fine-tuned models!**
+**Key insight**: "Hallucinations are fragile, correct answers are stable."
 
-### Key Finding: OmniSQL Prompt Format
+---
 
-Arctic-Text2SQL was trained using the **OmniSQL prompt format**:
-- Single user message (no system message)
-- "Task Overview: You are a data science expert..."
-- "Database Engine: SQLite" specification
-- "Take a deep breath and think step by step" instruction
-- Chain-of-thought in `<think>` tags, SQL in `<answer>` tags
+### Phase 2: Interactive Text-to-SQL (Current Focus)
 
-Using the correct format improved baseline from **54% → 60%** (+6 points).
+The BIRD benchmark has evolved beyond single-turn Text-to-SQL toward **Autonomous Database Agents**. We're pivoting to [BIRD-Interact](https://bird-interact.github.io/), which tests multi-turn clarification and ambiguity resolution.
 
-The remaining ~9 point gap to Arctic's reported 68.9% is likely due to their **value retrieval** technique, which extracts literal values from the database to help with case sensitivity and date formats.
+#### Why Pivot?
 
-### Common Failure Patterns
+| Benchmark | SOTA | Saturation | Our Opportunity |
+|-----------|------|------------|-----------------|
+| Classic BIRD | 81.7% | High | Incremental gains |
+| **BIRD-Interact** | **16-24%** | **Low** | **Wide open** |
 
-Analysis of failures shows:
-1. **Date format**: Model uses `SUBSTR(Date, 6, 2)` but data is `YYYYMM` format (month at position 5)
-2. **Case sensitivity**: Model uses `'discount'` but actual value is `'Discount'`
-3. **Extra columns**: Model adds computed columns not requested
+The classic BIRD leaderboard is dominated by agentic systems (81.7%). Meanwhile, BIRD-Interact—where models must handle ambiguous queries through clarification—has SOTA at only ~24%.
 
-These are exactly the issues **value retrieval** would fix.
+#### New Hypothesis
 
-### Future Work
+> **Plan-based consensus can identify the correct *interpretation* of ambiguous queries.**
 
-1. ✅ Implement OmniSQL prompt format - **Done, +6 points**
-2. 🔄 Test Arctic + M10 with new prompt format
-3. ⏳ Implement value retrieval technique
-4. ⏳ Run on full Dev set (1,534 examples)
+Standard self-consistency assumes the question is unambiguous. In interactive Text-to-SQL, ambiguity is the norm. When users ask vague questions:
+- Wrong interpretations → divergent execution plans
+- Correct interpretation → convergent execution plans
 
-### Paper Contribution
+Our plan voting methodology should transfer directly to this setting.
 
-**Title idea**: *"Inference-Time Scaling for Text-to-SQL: When It Works and When It Doesn't"*
+#### BIRD-Interact Dataset
 
-1. **Positive finding**: +12 points on base models without training
-2. **Negative finding**: Prompt format mismatch destroys fine-tuned model performance
-3. **Practical guidance**: How to adapt inference-time strategies for different model types
+We're using [Mini-Interact](https://huggingface.co/datasets/birdsql/mini-interact) (300 SQLite tasks):
+
+```python
+{
+  "amb_user_query": "Find total sales in CA",  # Ambiguous!
+  "user_query_ambiguity": {
+    "critical_ambiguity": [
+      {"term": "CA", "type": "schema_linking_ambiguity"}  # California? Canada?
+    ]
+  }
+}
+```
+
+**Setup**: 26 databases, SQLite backend, no Docker required.
+
+#### Proposed Method: Plan Consensus for Clarification
+
+```
+1. Generate N interpretations of ambiguous query
+2. For each interpretation → generate SQL → get execution plan
+3. Cluster by plan signature
+4. Largest cluster = most stable interpretation = likely correct
+5. If low consensus → ask clarifying question
+```
+
+#### Current Status
+
+| Task | Status |
+|------|--------|
+| Download Mini-Interact dataset | ✅ Done |
+| Request ground truth from BIRD team | ✅ Sent |
+| Create data loader | ⏳ Pending |
+| Implement multi-turn handler | ⏳ Pending |
+| Run baseline experiments | ⏳ Pending |
+
+#### Competitive Landscape (BIRD-Interact)
+
+| Model | Success Rate | Notes |
+|-------|--------------|-------|
+| GPT-5 | ~25% | a-Interact mode |
+| Gemini-2.5-Pro | ~21% | c-Interact mode |
+| Claude Sonnet 4.5 | ~20% | |
+| **Human** | **80%** | Ceiling |
+
+**Gap to close**: Current AI at ~25% vs human at 80%. Massive room for methodological contribution.
+
+---
+
+### Paper Direction
+
+**Title**: *"Plan-Based Consensus for Interactive Text-to-SQL"*
+
+**Contributions**:
+1. First application of execution plan consensus to multi-turn Text-to-SQL
+2. Training-free method competitive with fine-tuned approaches
+3. Analysis of when consensus succeeds/fails for ambiguity resolution
+
+**Related Work**:
+- [SWE-SQL/BIRD-Critic](https://arxiv.org/abs/2506.18951) (NeurIPS 2025) - SQL debugging benchmark
+- [CSC-SQL](https://github.com/cycloneboy/csc_sql) - Corrective self-consistency with GRPO
+- [SQLCritic](https://arxiv.org/abs/2503.07996) - Clause-wise error correction
 
 ### Available Models
 
@@ -295,14 +347,26 @@ These are exactly the issues **value retrieval** would fix.
 
 ## References
 
+### Benchmarks
 - [BIRD Benchmark](https://bird-bench.github.io/) - Li et al., NeurIPS 2023
+- [BIRD-Interact](https://bird-interact.github.io/) - Multi-turn interactive Text-to-SQL
+- [BIRD-Critic / SWE-SQL](https://arxiv.org/abs/2506.18951) - SQL debugging benchmark, NeurIPS 2025
+- [LiveSQLBench](https://livesqlbench.ai/) - Dynamic CRUD benchmark
+
+### Models & Methods
 - [Qwen2.5-Coder](https://github.com/QwenLM/Qwen2.5-Coder) - Alibaba Cloud
-- [Self-Consistency](https://arxiv.org/abs/2203.11171) - Wang et al., 2022
-- [EG-CFG](https://arxiv.org/abs/2506.10948) - Lavon et al., 2024
-- [DAIL-SQL](https://arxiv.org/abs/2308.15363) - Gao et al., 2023
-- [TA-SQL](https://arxiv.org/abs/2402.12960) - ACL Findings 2024
 - [Arctic-Text2SQL-R1](https://arxiv.org/abs/2505.20315) - Snowflake, May 2025
 - [OmniSQL](https://arxiv.org/abs/2503.02240) - RUCBM, 2025
+
+### Self-Consistency & Correction
+- [Self-Consistency](https://arxiv.org/abs/2203.11171) - Wang et al., 2022
+- [CSC-SQL](https://github.com/cycloneboy/csc_sql) - Corrective Self-Consistency with GRPO
+- [SQLCritic](https://arxiv.org/abs/2503.07996) - Clause-wise error correction
+
+### Other Text-to-SQL
+- [DAIL-SQL](https://arxiv.org/abs/2308.15363) - Gao et al., 2023
+- [TA-SQL](https://arxiv.org/abs/2402.12960) - ACL Findings 2024
+- [EG-CFG](https://arxiv.org/abs/2506.10948) - Lavon et al., 2024
 
 ## License
 
